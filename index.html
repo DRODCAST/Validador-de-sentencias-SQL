@@ -201,6 +201,12 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 .finding.ok .sev{background:var(--ok);}
 .finding-body{flex:1;}
 .finding-title{font-size:13.5px;font-weight:600;margin-bottom:3px;}
+.stmt-badge{
+  display:inline-block;font-family:'JetBrains Mono',monospace;font-weight:500;
+  font-size:10.5px;letter-spacing:.03em;text-transform:uppercase;
+  background:var(--panel);border:1px solid var(--border);color:var(--muted);
+  border-radius:5px;padding:1px 6px;margin-right:8px;vertical-align:middle;
+}
 .finding.critical .finding-title{color:var(--critical);}
 .finding.warning .finding-title{color:var(--warning);}
 .finding.info .finding-title{color:var(--info);}
@@ -960,6 +966,8 @@ function parseSelect(clean, original, info, findings, fixes){
       title: 'No se encontró la cláusula FROM',
       detail: 'Un SELECT sobre tablas requiere FROM para indicar de dónde se toman los datos. Verifica que la sentencia esté completa y bien escrita.'
     });
+    const end = original.replace(/\s+$/,'').length;
+    fixes.push({ start: end, end, replacement: ' /* FALTA: cláusula FROM con la tabla de origen */', kind:'flag' });
     return;
   }
 
@@ -1068,6 +1076,7 @@ function parseUpdate(clean, original, info, findings, fixes){
       title: 'UPDATE sin cláusula SET',
       detail: 'La sentencia no indica qué columnas actualizar; el motor la rechazará. Verifica que esté completa y bien escrita.'
     });
+    fixes.push({ start: tableEnd, end: tableEnd, replacement: ' /* FALTA: cláusula SET con las columnas a actualizar */', kind:'flag' });
   } else {
     const setStart = setMatches[0].index + 'SET'.length;
     const setEnd = whereMatches.length ? whereMatches[0].index : clean.length;
@@ -1123,6 +1132,9 @@ function parseInsert(clean, original, info, findings, fixes){
       title: 'INSERT sin cláusula INTO',
       detail: 'No se identificó la tabla destino. Verifica que la sentencia esté completa y bien escrita.'
     });
+    const insertIdx = clean.search(/\bINSERT\b/i);
+    const insertEnd = insertIdx >= 0 ? insertIdx + 'INSERT'.length : 0;
+    fixes.push({ start: insertEnd, end: insertEnd, replacement: ' /* FALTA: cláusula INTO con la tabla destino */', kind:'flag' });
     return;
   }
 
@@ -1318,7 +1330,6 @@ function analyze(raw, dialect){
   const findings = [];
   const clean = cleanSql(raw, findings);
   const parenIssues = locateParenIssues(clean);
-  reportParenIssues(parenIssues, findings);
 
   // Unifica las marcas con posición (comillas/comentarios sin cerrar +
   // paréntesis sin pareja) para poder señalarlas dentro de cada
@@ -1329,8 +1340,9 @@ function analyze(raw, dialect){
   ];
 
   const segments = splitStatements(clean, raw);
+  const multiStatement = segments.length > 1;
 
-  if(segments.length > 1){
+  if(multiStatement){
     findings.push({
       kind: KIND.ADVICE, severity: SEVERITY.WARNING,
       title: `El bloque contiene ${segments.length} sentencias`,
@@ -1338,23 +1350,51 @@ function analyze(raw, dialect){
     });
   }
 
+  let displayCounter = 0;
   const statements = segments
     .map(segment => {
+      const segStart = segment.start;
+      const segEnd = segment.start + segment.clean.length;
+      const inSegment = pos => pos >= segStart && pos < segEnd;
+
       const marksHere = globalMarks
-        .filter(m => m.pos >= segment.start && m.pos < segment.start + segment.clean.length)
-        .map(m => ({ pos: m.pos - segment.start, type: m.type }));
-      return parseStatement(segment, findings, marksHere);
+        .filter(m => inSegment(m.pos))
+        .map(m => ({ pos: m.pos - segStart, type: m.type }));
+
+      // Los problemas de paréntesis de ESTA sentencia se reportan aquí
+      // (en vez de una sola vez para todo el bloque) para poder decir
+      // en cuál sentencia están.
+      const beforeLen = findings.length;
+      const parenIssuesHere = parenIssues.filter(i => inSegment(i.index));
+      if(parenIssuesHere.length) reportParenIssues(parenIssuesHere, findings);
+
+      const info = parseStatement(segment, findings, marksHere);
+      const label = info ? (++displayCounter) : null;
+
+      if(multiStatement){
+        // Hallazgos generados en esta vuelta (paréntesis + parseStatement).
+        for(let i = beforeLen; i < findings.length; i++) findings[i].stmtLabel = label;
+        // Hallazgos de comilla/comentario sin cerrar: se agregaron al
+        // principio (antes de dividir en sentencias), así que se
+        // etiquetan aparte por posición.
+        findings
+          .filter(f => typeof f.pos === 'number' && inSegment(f.pos) && f.stmtLabel === undefined)
+          .forEach(f => { f.stmtLabel = label; });
+      }
+
+      return info;
     })
     .filter(Boolean);
 
   const lastSegment = segments[segments.length - 1];
   if(lastSegment && lastSegment.missingSemicolon){
+    const lastStatement = statements[statements.length - 1];
     findings.push({
       kind: KIND.ADVICE, severity: SEVERITY.INFO,
       title: 'La sentencia no termina en punto y coma',
-      detail: 'Muchos ejecutores de scripts requieren el ; final para saber dónde termina cada instrucción. Agregarlo evita errores al correr el script completo.'
+      detail: 'Muchos ejecutores de scripts requieren el ; final para saber dónde termina cada instrucción. Agregarlo evita errores al correr el script completo.',
+      stmtLabel: multiStatement ? statements.length : undefined
     });
-    const lastStatement = statements[statements.length - 1];
     if(lastStatement){
       const end = lastStatement.sourceText.length;
       lastStatement.fixes.push({ start: end, end, replacement: ';', kind:'fix' });
@@ -1431,13 +1471,16 @@ function renderStatement(statement, index, total){
 }
 
 function renderFinding(finding){
+  const badge = finding.stmtLabel
+    ? `<span class="stmt-badge">Sentencia ${finding.stmtLabel}</span>`
+    : '';
   const where = finding.where
     ? `<div class="finding-where">${escapeHtml(finding.where)}</div>`
     : '';
   return `<div class="finding ${finding.severity}">
     <div class="sev" aria-hidden="true"></div>
     <div class="finding-body">
-      <div class="finding-title">${escapeHtml(finding.title)}</div>
+      <div class="finding-title">${badge}${escapeHtml(finding.title)}</div>
       <div class="finding-detail">${escapeHtml(finding.detail)}</div>
       ${where}
     </div>
