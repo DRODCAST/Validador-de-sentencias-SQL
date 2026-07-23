@@ -233,6 +233,20 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
   background:var(--accent-dim);color:var(--accent);
   border-radius:4px;padding:0 3px;font-style:normal;
 }
+.suggestion mark.error{
+  background:var(--critical-dim);color:var(--critical);
+  border-radius:4px;padding:0 3px;font-style:normal;
+}
+.suggestion del.removed{
+  background:var(--critical-dim);color:var(--critical);
+  text-decoration:line-through;
+  border-radius:4px;padding:0 3px;
+}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin:0 0 10px;}
+.legend span{display:inline-flex;align-items:center;gap:6px;}
+.legend .swatch{width:10px;height:10px;border-radius:3px;display:inline-block;}
+.legend .swatch.fix{background:var(--accent);}
+.legend .swatch.error{background:var(--critical);}
 .copy-btn{
   position:absolute;top:8px;right:8px;
   padding:4px 10px !important;font-size:11.5px !important;
@@ -421,13 +435,18 @@ function levenshtein(a, b){
 
 /**
  * Reemplaza el contenido de strings ('...') y comentarios (-- y bloque)
- * por espacios, conservando el largo y los saltos de línea.
+ * por espacios, conservando el largo y los saltos de línea. Si la
+ * cadena termina dentro de un string o comentario sin cerrar, agrega
+ * un hallazgo con `pos` (índice donde empezó) y `markType`, para poder
+ * señalar el punto exacto más adelante.
  */
 function cleanSql(raw, findings){
   const STATE = { NORMAL:0, STRING:1, LINE_COMMENT:2, BLOCK_COMMENT:3 };
   let state = STATE.NORMAL;
   let out = '';
   let i = 0;
+  let stringStart = -1;
+  let commentStart = -1;
 
   while(i < raw.length){
     const ch = raw[i];
@@ -435,9 +454,9 @@ function cleanSql(raw, findings){
 
     switch(state){
       case STATE.NORMAL:
-        if(ch === "'"){ state = STATE.STRING; out += "'"; i++; }
+        if(ch === "'"){ state = STATE.STRING; stringStart = i; out += "'"; i++; }
         else if(ch === '-' && next === '-'){ state = STATE.LINE_COMMENT; out += '  '; i += 2; }
-        else if(ch === '/' && next === '*'){ state = STATE.BLOCK_COMMENT; out += '  '; i += 2; }
+        else if(ch === '/' && next === '*'){ state = STATE.BLOCK_COMMENT; commentStart = i; out += '  '; i += 2; }
         else { out += ch; i++; }
         break;
 
@@ -463,41 +482,56 @@ function cleanSql(raw, findings){
     findings.push({
       kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'Comilla simple sin cerrar',
-      detail: 'Hay un literal de texto que no se cierra correctamente. Esto provocará un error de sintaxis al ejecutar el script.'
+      detail: 'Hay un literal de texto que no se cierra correctamente. Esto provocará un error de sintaxis al ejecutar el script.',
+      pos: stringStart, markType: 'quote'
     });
   }
   if(state === STATE.BLOCK_COMMENT){
     findings.push({
       kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'Comentario de bloque sin cerrar (/* ... */)',
-      detail: 'Falta el cierre */ de un comentario. Puede "comerse" parte de la sentencia sin que se note a simple vista.'
+      detail: 'Falta el cierre */ de un comentario. Puede "comerse" parte de la sentencia sin que se note a simple vista.',
+      pos: commentStart, markType: 'comment'
     });
   }
 
   return out;
 }
 
-function checkParenBalance(clean, findings){
-  let depth = 0;
-  let extraClosers = 0;
-  for(const ch of clean){
-    if(ch === '(') depth++;
-    else if(ch === ')'){
-      if(depth === 0) extraClosers++;
-      else depth--;
+/**
+ * Localiza cada paréntesis sin pareja en el texto limpio: aperturas
+ * que nunca se cierran ('unclosed-open') y cierres sin apertura
+ * ('extra-close'), con su índice exacto.
+ */
+function locateParenIssues(clean){
+  const stack = [];
+  const issues = [];
+  for(let i = 0; i < clean.length; i++){
+    if(clean[i] === '(') stack.push(i);
+    else if(clean[i] === ')'){
+      if(stack.length) stack.pop();
+      else issues.push({ index:i, type:'extra-close' });
     }
   }
-  if(depth > 0){
+  for(const idx of stack) issues.push({ index:idx, type:'unclosed-open' });
+  return issues;
+}
+
+/** Convierte la lista de locateParenIssues() en hallazgos de resumen. */
+function reportParenIssues(issues, findings){
+  const missing = issues.filter(i => i.type === 'unclosed-open').length;
+  const extra = issues.filter(i => i.type === 'extra-close').length;
+  if(missing > 0){
     findings.push({
       kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
-      title: depth === 1 ? 'Falta 1 paréntesis por cerrar' : `Faltan ${depth} paréntesis por cerrar`,
+      title: missing === 1 ? 'Falta 1 paréntesis por cerrar' : `Faltan ${missing} paréntesis por cerrar`,
       detail: 'El desbalance de paréntesis hará que el motor de base de datos rechace la sentencia.'
     });
   }
-  if(extraClosers > 0){
+  if(extra > 0){
     findings.push({
       kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
-      title: extraClosers === 1 ? 'Sobra 1 paréntesis de cierre' : `Sobran ${extraClosers} paréntesis de cierre`,
+      title: extra === 1 ? 'Sobra 1 paréntesis de cierre' : `Sobran ${extra} paréntesis de cierre`,
       detail: 'Hay paréntesis de cierre sin su apertura correspondiente; el motor rechazará la sentencia.'
     });
   }
@@ -538,6 +572,8 @@ function matchingParen(text, openIdx){
   return -1;
 }
 
+/** Separa el bloque en sentencias por ';' a profundidad 0, conservando
+ *  el offset de inicio de cada una dentro del texto completo. */
 function splitStatements(clean, raw){
   const segments = [];
   let depth = 0;
@@ -547,12 +583,12 @@ function splitStatements(clean, raw){
     if(ch === '(') depth++;
     else if(ch === ')') depth = Math.max(0, depth - 1);
     else if(ch === ';' && depth === 0){
-      segments.push({ clean: clean.slice(start,i), original: raw.slice(start,i) });
+      segments.push({ clean: clean.slice(start,i), original: raw.slice(start,i), start });
       start = i + 1;
     }
   }
   if(raw.slice(start).trim()){
-    segments.push({ clean: clean.slice(start), original: raw.slice(start), missingSemicolon:true });
+    segments.push({ clean: clean.slice(start), original: raw.slice(start), start, missingSemicolon:true });
   }
   return segments;
 }
@@ -583,12 +619,21 @@ function fieldsAsTags(cleanSlice, origSlice){
 }
 
 /**
- * Aplica correcciones {start, end, replacement} sobre un texto y
- * devuelve la versión corregida en texto plano y en HTML con los
- * cambios resaltados. Los rangos no deben traslaparse.
+ * Aplica anotaciones {start, end, replacement, kind} sobre un texto y
+ * devuelve la versión resultante en texto plano y en HTML resaltado.
+ * kind determina el estilo visual:
+ *   'fix'  → corrección aplicada con confianza (resaltado verde), o si
+ *            replacement === '' un texto eliminado (tachado en rojo).
+ *   'flag' → señala el problema y el punto exacto sin adivinar el
+ *            contenido correcto (resaltado rojo).
+ * Los rangos no deben traslaparse.
  */
 function applyFixes(sourceText, fixes){
-  const sorted = [...fixes].sort((a,b) => a.start - b.start);
+  // Ordena por posición de inicio; ante empate, primero las inserciones
+  // de ancho cero (end === start) — así una marca "falta esto aquí" no
+  // termina insertándose en medio de una corrección que arranca en el
+  // mismo punto (ej. una palabra clave ya corregida).
+  const sorted = [...fixes].sort((a,b) => a.start - b.start || (a.end - a.start) - (b.end - b.start));
   let plain = '';
   let html = '';
   let pos = 0;
@@ -596,8 +641,19 @@ function applyFixes(sourceText, fixes){
     const start = Math.max(pos, Math.min(fix.start, sourceText.length));
     const end = Math.max(start, Math.min(fix.end, sourceText.length));
     const before = sourceText.slice(pos, start);
-    plain += before + fix.replacement;
-    html += escapeHtml(before) + `<mark class="fix">${escapeHtml(fix.replacement)}</mark>`;
+    plain += before;
+    html += escapeHtml(before);
+
+    if(fix.kind === 'fix' && fix.replacement === ''){
+      // Eliminación segura (ej. paréntesis de cierre sobrante): se
+      // muestra tachada en lugar de desaparecer sin dejar rastro.
+      const removed = sourceText.slice(start, end);
+      html += `<del class="removed">${escapeHtml(removed)}</del>`;
+    } else {
+      const cls = fix.kind === 'flag' ? 'error' : 'fix';
+      html += `<mark class="${cls}">${escapeHtml(fix.replacement)}</mark>`;
+      plain += fix.replacement;
+    }
     pos = end;
   }
   const tail = sourceText.slice(pos);
@@ -710,7 +766,55 @@ function repairTypos(text, typos){
   return { repaired, highlights };
 }
 
-/* ---------- Chequeos compartidos ---------- */
+/**
+ * Traslada una posición del texto original al texto ya reparado
+ * (después de repairTypos), sumando el mismo delta acumulado que usa
+ * repairTypos. Sirve para reubicar marcas (comillas/paréntesis) que se
+ * calcularon antes de corregir las palabras clave.
+ */
+function remapThroughTypos(pos, typos){
+  let delta = 0;
+  for(const typo of typos){
+    if(typo.end <= pos) delta += typo.suggestion.length - (typo.end - typo.start);
+    else break;
+  }
+  return pos + delta;
+}
+
+/**
+ * Convierte una marca de posición (comilla/comentario sin cerrar,
+ * paréntesis sin pareja) en una o dos anotaciones visuales sobre el
+ * texto reparado. No se adivina contenido: solo se señala el punto
+ * exacto en rojo, salvo el paréntesis de cierre sobrante, que sí se
+ * puede eliminar con seguridad (auto-fix en verde).
+ */
+function markToAnnotations(mark, posInRepaired){
+  switch(mark.type){
+    case 'quote':
+      return [
+        { start: posInRepaired, end: posInRepaired + 1, replacement: "'", kind:'flag' },
+        { start: posInRepaired + 1, end: posInRepaired + 1, replacement: ' /* FALTA: cerrar esta comilla */', kind:'flag' }
+      ];
+    case 'comment':
+      return [
+        { start: posInRepaired, end: posInRepaired + 2, replacement: '/*', kind:'flag' },
+        { start: posInRepaired + 2, end: posInRepaired + 2, replacement: ' FALTA cerrar este comentario ', kind:'flag' }
+      ];
+    case 'unclosed-open':
+      return [
+        { start: posInRepaired, end: posInRepaired + 1, replacement: '(', kind:'flag' },
+        { start: posInRepaired + 1, end: posInRepaired + 1, replacement: ' /* FALTA: paréntesis de cierre */', kind:'flag' }
+      ];
+    case 'extra-close':
+      // Paréntesis de cierre sin apertura: se puede quitar sin
+      // ambigüedad, es una corrección segura (verde, tachado).
+      return [
+        { start: posInRepaired, end: posInRepaired + 1, replacement: '', kind:'fix' }
+      ];
+    default:
+      return [];
+  }
+}
 
 function makeNoWhereFinding(keyword){
   return {
@@ -722,7 +826,7 @@ function makeNoWhereFinding(keyword){
 
 function pushMissingWherePlaceholder(original, fixes){
   const insertAt = original.replace(/\s+$/,'').length;
-  fixes.push({ start: insertAt, end: insertAt, replacement: ' /* FALTA: condición WHERE que delimite los registros */' });
+  fixes.push({ start: insertAt, end: insertAt, replacement: ' /* FALTA: condición WHERE que delimite los registros */', kind:'flag' });
 }
 
 /**
@@ -819,6 +923,35 @@ function checkNullComparisons(clean, findings, fixes){
 
 /* ---------- Análisis por tipo de sentencia ---------- */
 
+/** Cláusulas de un SELECT que deben aparecer, si existen, en este orden. */
+const CLAUSE_SEQUENCE = Object.freeze([
+  { key:'WHERE',       label:'WHERE',       re:/\bWHERE\b/i },
+  { key:'GROUP_BY',    label:'GROUP BY',    re:/\bGROUP\s+BY\b/i },
+  { key:'HAVING',      label:'HAVING',      re:/\bHAVING\b/i },
+  { key:'CONNECT_BY',  label:'CONNECT BY',  re:/\bCONNECT\s+BY\b/i },
+  { key:'ORDER_BY',    label:'ORDER BY',    re:/\bORDER\s+BY\b/i },
+  { key:'UNION',       label:'UNION',       re:/\bUNION\b/i },
+  { key:'FETCH_FIRST', label:'FETCH FIRST', re:/\bFETCH\s+FIRST\b/i }
+]);
+
+/** Orden canónico solo para las cláusulas cuya posición relativa es
+ *  inequívoca (WHERE → GROUP BY → HAVING → ORDER BY). CONNECT BY,
+ *  UNION y FETCH FIRST se usan como límites pero no entran en este
+ *  chequeo de orden para evitar falsos positivos. */
+const CLAUSE_CANONICAL_RANK = Object.freeze({ WHERE:0, GROUP_BY:1, HAVING:2, ORDER_BY:3 });
+
+/** Primera aparición top-level de cada cláusula dentro de un rango de `clean`. */
+function locateClauses(clean, rangeStart, rangeEnd){
+  const found = [];
+  for(const clause of CLAUSE_SEQUENCE){
+    const matches = topLevelMatches(clean.slice(rangeStart, rangeEnd), clause.re);
+    if(matches.length){
+      found.push({ key:clause.key, label:clause.label, index: rangeStart + matches[0].index, length: matches[0].text.length });
+    }
+  }
+  return found.sort((a,b) => a.index - b.index);
+}
+
 function parseSelect(clean, original, info, findings, fixes){
   const fromMatches = topLevelMatches(clean, /\bFROM\b/i);
   if(!fromMatches.length){
@@ -832,15 +965,44 @@ function parseSelect(clean, original, info, findings, fixes){
 
   const fromIdx = fromMatches[0].index;
   const selectIdx = clean.search(/\bSELECT\b/i);
-
   const fieldsStart = selectIdx + 'SELECT'.length;
+
   info.fields = fieldsAsTags(clean.slice(fieldsStart, fromIdx), original.slice(fieldsStart, fromIdx)) || '(vacío)';
 
-  const afterFrom = clean.slice(fromIdx + 'FROM'.length);
-  const enders = topLevelMatches(afterFrom, /\b(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|UNION|CONNECT\s+BY|FETCH\s+FIRST)\b/i);
-  const fromEnd = enders.length ? fromIdx + 'FROM'.length + enders[0].index : clean.length;
+  // Cláusulas que aparecen ANTES de FROM (ej. un WHERE metido en la
+  // lista de campos): posición inválida, se señala en rojo sin mover
+  // nada — moverlo automáticamente sería adivinar dónde iba.
+  const clausesBeforeFrom = locateClauses(clean, fieldsStart, fromIdx);
+  clausesBeforeFrom.forEach(clause => {
+    findings.push({
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
+      title: `La cláusula ${clause.label} aparece antes de FROM`,
+      detail: `${clause.label} no puede ir en la lista de campos, antes de indicar de qué tabla vienen los datos. El motor no la interpretará como condición ahí; probablemente rechace la sentencia o la lea como un alias.`,
+      where: original.slice(fieldsStart, fromIdx).trim()
+    });
+    fixes.push({ start: clause.index, end: clause.index + clause.length, replacement: original.slice(clause.index, clause.index + clause.length), kind:'flag' });
+    fixes.push({ start: clause.index + clause.length, end: clause.index + clause.length, replacement: ' /* POSICIÓN INVÁLIDA: no puede ir antes de FROM */', kind:'flag' });
+  });
+
+  // Cláusulas después de FROM, en el orden en que realmente aparecen.
+  const clausesAfterFrom = locateClauses(clean, fromIdx + 'FROM'.length, clean.length);
+  const fromEnd = clausesAfterFrom.length ? clausesAfterFrom[0].index : clean.length;
   const fromTextClean = clean.slice(fromIdx + 'FROM'.length, fromEnd);
   info.tables = collapseSpaces(original.slice(fromIdx + 'FROM'.length, fromEnd)) || '(no identificada)';
+
+  // El orden correcto es WHERE → GROUP BY → HAVING → ORDER BY.
+  for(let i = 0; i < clausesAfterFrom.length - 1; i++){
+    const a = clausesAfterFrom[i], b = clausesAfterFrom[i+1];
+    const rankA = CLAUSE_CANONICAL_RANK[a.key];
+    const rankB = CLAUSE_CANONICAL_RANK[b.key];
+    if(rankA !== undefined && rankB !== undefined && rankA > rankB){
+      findings.push({
+        kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
+        title: `Cláusulas en orden incorrecto: ${a.label} aparece antes que ${b.label}`,
+        detail: `El orden correcto en SQL es FROM → WHERE → GROUP BY → HAVING → ORDER BY, así que ${a.label} debería ir después de ${b.label}, no antes. Tal como está, el motor rechazará la sentencia.`
+      });
+    }
+  }
 
   const joinMatches = topLevelMatches(fromTextClean, /\bJOIN\b/i);
   joinMatches.forEach((jm, idx) => {
@@ -856,20 +1018,26 @@ function parseSelect(clean, original, info, findings, fixes){
     }
   });
 
-  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
-  if(whereMatches.length){
-    const whereStart = whereMatches[0].index + 'WHERE'.length;
-    const afterWhere = topLevelMatches(clean.slice(whereStart), /\b(GROUP\s+BY|ORDER\s+BY|HAVING|UNION|FETCH\s+FIRST)\b/i);
-    const whereEnd = afterWhere.length ? whereStart + afterWhere[0].index : clean.length;
+  const whereEntry = clausesAfterFrom.find(c => c.key === 'WHERE');
+  if(whereEntry){
+    const whereStart = whereEntry.index + whereEntry.length;
+    const nextEntry = clausesAfterFrom.find(c => c.index > whereEntry.index);
+    const whereEnd = nextEntry ? nextEntry.index : clean.length;
     info.where = collapseSpaces(original.slice(whereStart, whereEnd)) || '(vacío)';
     checkWhereValueLists(clean, original, whereStart, whereEnd, findings, fixes);
   } else {
     info.where = '(sin condición)';
-    findings.push({
-      kind: KIND.ADVICE, severity: SEVERITY.WARNING,
-      title: 'La consulta no tiene condición WHERE',
-      detail: 'Sin WHERE la consulta devolverá todas las filas de la tabla. Si es a propósito está bien, pero en tablas grandes puede tardar mucho o saturar la sesión. Si buscas registros específicos, agrega una condición.'
-    });
+    // Si ya se señaló un WHERE mal ubicado antes de FROM, ese hallazgo
+    // más específico ya cubre el problema; evita duplicar el aviso.
+    const misplacedWhere = clausesBeforeFrom.some(c => c.key === 'WHERE');
+    if(!misplacedWhere){
+      findings.push({
+        kind: KIND.ADVICE, severity: SEVERITY.WARNING,
+        title: 'La consulta no tiene condición WHERE',
+        detail: 'Sin WHERE la consulta devolverá todas las filas de la tabla. Si es a propósito está bien, pero en tablas grandes puede tardar mucho o saturar la sesión. Si buscas registros específicos, agrega una condición.'
+      });
+      fixes.push({ start: fromEnd, end: fromEnd, replacement: ' /* FALTA: agrega aquí una condición WHERE si necesitas filtrar */', kind:'flag' });
+    }
   }
 
   if(/\bSELECT\s+(?:\w+\s*\.\s*)?\*/i.test(clean.slice(0, fromIdx))){
@@ -884,7 +1052,11 @@ function parseSelect(clean, original, info, findings, fixes){
 function parseUpdate(clean, original, info, findings, fixes){
   const updateMatch = clean.match(/\bUPDATE\b/i);
   const setMatches = topLevelMatches(clean, /\bSET\b/i);
-  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
+  // WHERE solo cuenta si aparece después de SET; uno antes está mal
+  // ubicado (ej. en la lista de tabla) y no debe tratarse como la
+  // condición real.
+  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i)
+    .filter(m => !setMatches.length || m.index > setMatches[0].index);
 
   const tableStart = updateMatch.index + 'UPDATE'.length;
   const tableEnd = setMatches.length ? setMatches[0].index : clean.length;
@@ -916,7 +1088,10 @@ function parseUpdate(clean, original, info, findings, fixes){
 function parseDelete(clean, original, info, findings, fixes){
   const deleteMatch = clean.match(/\bDELETE\b/i);
   const fromMatches = topLevelMatches(clean, /\bFROM\b/i);
-  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
+  // WHERE solo cuenta si aparece después de la tabla (FROM, o DELETE
+  // si no hay FROM explícito); uno antes está mal ubicado.
+  const anchorIdx = fromMatches.length ? fromMatches[0].index : deleteMatch.index;
+  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i).filter(m => m.index > anchorIdx);
 
   const tableStart = fromMatches.length
     ? fromMatches[0].index + 'FROM'.length
@@ -1021,9 +1196,14 @@ function parseMerge(clean, info, findings){
 
 /**
  * Analiza una sentencia individual sobre su versión reparada.
+ * @param {object} segment  {clean, original, start} de splitStatements().
+ * @param {Array} findings  Lista compartida de hallazgos (se le agrega).
+ * @param {Array} marks     Marcas de posición (comillas/paréntesis sin
+ *                          pareja) que caen dentro de este segmento,
+ *                          en coordenadas locales a segment.clean.
  * Devuelve metadatos + fixes con índices relativos a sourceText.
  */
-function parseStatement(segment, findings){
+function parseStatement(segment, findings, marks){
   if(!segment.clean.trim()) return null;
 
   // 1. Corregir palabras clave mal escritas antes de interpretar.
@@ -1038,6 +1218,12 @@ function parseStatement(segment, findings){
       where: `${typo.token}  →  ${typo.suggestion}`
     });
   });
+
+  // Traslada cada marca (calculada antes de reparar typos) a su
+  // posición en el texto reparado, y la convierte en anotación visual.
+  const markAnnotations = (marks || []).flatMap(mark =>
+    markToAnnotations(mark, remapThroughTypos(mark.pos, typos))
+  );
 
   // 2. Trabajar sobre el texto reparado (índices realineados).
   let clean = cleanSql(repaired, []);
@@ -1092,14 +1278,17 @@ function parseStatement(segment, findings){
 
   checkNullComparisons(clean, findings, fixes);
 
-  // 3. Alinear los fixes al texto que se mostrará (sentencia reparada
-  //    y recortada) y sumar los resaltados de palabras corregidas.
+  // 3. Alinear todo al texto que se mostrará (sentencia reparada y
+  //    recortada): resaltados de typos y marcas usan las coordenadas
+  //    de `repaired` directamente; los fixes de cada parseXxx usan las
+  //    coordenadas de `clean`/`original` (desplazadas `shift` si hubo CTE).
   const lead0 = repaired.length - repaired.trimStart().length;
   info.sourceText = repaired.trim();
   info.fixes = [
-    ...highlights.map(h => ({ start:h.start - lead0, end:h.end - lead0, replacement:h.replacement })),
-    ...fixes.map(f => ({ start:f.start + shift - lead0, end:f.end + shift - lead0, replacement:f.replacement }))
-  ].map(f => ({ start: Math.max(0, f.start), end: Math.max(0, f.end), replacement: f.replacement }));
+    ...highlights.map(h => ({ start:h.start - lead0, end:h.end - lead0, replacement:h.replacement, kind:'fix' })),
+    ...markAnnotations.map(m => ({ start:m.start - lead0, end:m.end - lead0, replacement:m.replacement, kind:m.kind })),
+    ...fixes.map(f => ({ start:f.start + shift - lead0, end:f.end + shift - lead0, replacement:f.replacement, kind:f.kind || 'fix' }))
+  ].map(f => ({ start: Math.max(0, f.start), end: Math.max(0, f.end), replacement: f.replacement, kind: f.kind }));
 
   return info;
 }
@@ -1128,7 +1317,16 @@ function runDialectChecks(clean, dialect, findings){
 function analyze(raw, dialect){
   const findings = [];
   const clean = cleanSql(raw, findings);
-  checkParenBalance(clean, findings);
+  const parenIssues = locateParenIssues(clean);
+  reportParenIssues(parenIssues, findings);
+
+  // Unifica las marcas con posición (comillas/comentarios sin cerrar +
+  // paréntesis sin pareja) para poder señalarlas dentro de cada
+  // sentencia más abajo, en vez de solo reportarlas como texto.
+  const globalMarks = [
+    ...findings.filter(f => typeof f.pos === 'number').map(f => ({ pos:f.pos, type:f.markType })),
+    ...parenIssues.map(i => ({ pos:i.index, type:i.type }))
+  ];
 
   const segments = splitStatements(clean, raw);
 
@@ -1141,7 +1339,12 @@ function analyze(raw, dialect){
   }
 
   const statements = segments
-    .map(segment => parseStatement(segment, findings))
+    .map(segment => {
+      const marksHere = globalMarks
+        .filter(m => m.pos >= segment.start && m.pos < segment.start + segment.clean.length)
+        .map(m => ({ pos: m.pos - segment.start, type: m.type }));
+      return parseStatement(segment, findings, marksHere);
+    })
     .filter(Boolean);
 
   const lastSegment = segments[segments.length - 1];
@@ -1154,7 +1357,7 @@ function analyze(raw, dialect){
     const lastStatement = statements[statements.length - 1];
     if(lastStatement){
       const end = lastStatement.sourceText.length;
-      lastStatement.fixes.push({ start: end, end, replacement: ';' });
+      lastStatement.fixes.push({ start: end, end, replacement: ';', kind:'fix' });
     }
   }
 
@@ -1251,7 +1454,10 @@ function renderFindingSection(title, cssClass, findings){
 function renderSuggestions(suggestions){
   if(!suggestions.length) return '';
   let html = `<h2 class="section-head fix"><span class="dot" aria-hidden="true"></span>Sentencia corregida</h2>`;
-  html += `<p class="note">Los fragmentos resaltados son las correcciones aplicadas o lo que falta y en qué punto va. Revísala antes de usarla.</p>`;
+  html += `<p class="legend">
+    <span><span class="swatch fix" aria-hidden="true"></span>Corrección aplicada automáticamente</span>
+    <span><span class="swatch error" aria-hidden="true"></span>Encontramos el problema y el punto exacto, pero no adivinamos el valor o condición — complétalo tú</span>
+  </p>`;
   suggestions.forEach((s, i) => {
     const head = s.total > 1 ? `<div class="stmt-head">Sentencia ${s.index + 1} — ${escapeHtml(s.type)}</div>` : '';
     html += `<div class="suggestion-wrap">${head}
@@ -1364,7 +1570,7 @@ renderEmpty();
 
 // Expuesto solo para pruebas automatizadas (no forma parte de la UI).
 if(typeof window !== 'undefined'){
-  window.__sqlValidator = { analyze, applyFixes, detectKeywordTypos, levenshtein };
+  window.__sqlValidator = { analyze, applyFixes, detectKeywordTypos, levenshtein, locateParenIssues };
 }
 
 })();
