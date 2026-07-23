@@ -175,10 +175,21 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 }
 .meta-card.full{grid-column:1/-1;}
 
-.findings-title{
-  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);
-  text-transform:uppercase;letter-spacing:.06em;margin:20px 0 10px;font-weight:500;
+.section-head{
+  display:flex;align-items:center;gap:8px;
+  font-family:'JetBrains Mono',monospace;font-size:11px;
+  text-transform:uppercase;letter-spacing:.06em;margin:22px 0 10px;font-weight:500;
 }
+.section-head .dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+.section-head.review{color:var(--critical);}
+.section-head.review .dot{background:var(--critical);}
+.section-head.advice{color:var(--warning);}
+.section-head.advice .dot{background:var(--warning);}
+.section-head.fix{color:var(--accent);}
+.section-head.fix .dot{background:var(--accent);}
+.section-head.clear{color:var(--ok);}
+.section-head.clear .dot{background:var(--ok);}
+
 .finding{
   display:flex;gap:12px;padding:12px 14px;border-radius:10px;
   border:1px solid var(--border);background:var(--panel-2);margin-bottom:9px;
@@ -187,15 +198,18 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 .finding.critical .sev{background:var(--critical);}
 .finding.warning .sev{background:var(--warning);}
 .finding.info .sev{background:var(--info);}
+.finding.ok .sev{background:var(--ok);}
 .finding-body{flex:1;}
 .finding-title{font-size:13.5px;font-weight:600;margin-bottom:3px;}
 .finding.critical .finding-title{color:var(--critical);}
 .finding.warning .finding-title{color:var(--warning);}
 .finding.info .finding-title{color:var(--info);}
-.finding-detail{font-size:12.5px;color:var(--muted);line-height:1.5;}
-.finding-detail code{
-  font-family:'JetBrains Mono',monospace;background:#0F1520;padding:1px 5px;
-  border-radius:4px;color:#C8D3E8;
+.finding.ok .finding-title{color:var(--ok);}
+.finding-detail{font-size:12.5px;color:var(--muted);line-height:1.55;}
+.finding-where{
+  font-family:'JetBrains Mono',monospace;font-size:12px;color:#C8D3E8;
+  background:#0F1520;border-radius:6px;padding:4px 8px;margin-top:6px;
+  display:inline-block;word-break:break-word;
 }
 
 .stmt-block{margin-bottom:16px;}
@@ -204,7 +218,7 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
   font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--accent);
   margin-bottom:8px;
 }
-.cte-note{font-size:12.5px;color:var(--muted);line-height:1.5;margin:0 0 10px;}
+.note{font-size:12.5px;color:var(--muted);line-height:1.55;margin:0 0 10px;}
 
 .suggestion-wrap{margin-bottom:12px;}
 .pre-wrap{position:relative;}
@@ -285,27 +299,53 @@ footer{
  * Análisis heurístico de texto: no ejecuta SQL ni se conecta
  * a ninguna base de datos.
  *
- * Diseño general:
- *  - cleanSql()        "apaga" strings y comentarios conservando
- *                      el largo del texto, para mapear posiciones
- *                      del texto limpio al texto original.
- *  - splitStatements() separa sentencias por ';' a nivel superior.
- *  - parseStatement()  extrae metadatos (tipo, tablas, campos,
- *                      WHERE), agrega hallazgos y genera "fixes":
- *                      rangos de texto con su corrección sugerida.
- *  - applyFixes()      aplica los fixes sobre la sentencia original
- *                      para producir la sugerencia de corrección
- *                      con los cambios resaltados.
+ * Flujo por sentencia:
+ *  1. cleanSql()          apaga strings y comentarios conservando
+ *                         el largo, para alinear índices.
+ *  2. splitStatements()   separa por ';' a nivel superior.
+ *  3. detectKeywordTypos()detecta palabras clave mal escritas
+ *                         (SELET, WHEREE, FORM...).
+ *  4. repairTypos()       reescribe la sentencia con las palabras
+ *                         corregidas para poder analizarla bien.
+ *  5. parseStatement()    extrae metadatos y genera hallazgos +
+ *                         "fixes" (rangos con su corrección).
+ *  6. applyFixes()        arma la sentencia corregida resaltando
+ *                         cada cambio.
+ *
+ * Clasificación de hallazgos:
+ *  - REVIEW  (requiere revisión): errores de sintaxis, condiciones
+ *            faltantes o mal escritas, riesgos en productivo.
+ *  - ADVICE  (advertencia / recomendación): queda a criterio del
+ *            usuario; explica qué implica lo que escribió.
  * ============================================================ */
 
+const KIND = Object.freeze({ REVIEW:'review', ADVICE:'advice' });
 const SEVERITY = Object.freeze({ CRITICAL:'critical', WARNING:'warning', INFO:'info' });
 const SEVERITY_ORDER = Object.freeze({ critical:0, warning:1, info:2 });
 
 const STAMP = Object.freeze({
   ok:   { css:'ok',   label:'Sin observaciones' },
-  warn: { css:'warn', label:'Revisar advertencias' },
+  warn: { css:'warn', label:'Revisar recomendaciones' },
   crit: { css:'crit', label:'Requiere revisión' }
 });
+
+/**
+ * Palabras clave estructurales: si una de estas se escribe mal, la
+ * sentencia falla o cambia de significado. Se usan para detectar
+ * errores de dedo por distancia de edición.
+ */
+const STRUCTURAL_KEYWORDS = Object.freeze([
+  'SELECT','FROM','WHERE','ORDER','GROUP','HAVING','INSERT','INTO','VALUES',
+  'UPDATE','DELETE','JOIN','INNER','LEFT','RIGHT','OUTER','CROSS','UNION',
+  'DISTINCT','BETWEEN','LIKE','EXISTS','TRUNCATE','TABLE','CREATE','ALTER',
+  'DROP','MERGE','MATCHED','THEN','WHEN','ELSE','CASE','COMMIT','ROLLBACK',
+  'INTERSECT','EXCEPT','FETCH','OFFSET','LIMIT'
+]);
+
+/** Palabras que anteceden a un identificador (tabla, columna, alias). */
+const IDENTIFIER_PREDECESSORS = Object.freeze(new Set([
+  'AS','FROM','JOIN','INTO','UPDATE','TABLE','SELECT','BY','DISTINCT'
+]));
 
 /** Sintaxis ajena a cada dialecto. */
 const DIALECT_CHECKS = Object.freeze({
@@ -344,6 +384,42 @@ function collapseSpaces(value){
 }
 
 /**
+ * Distancia de Damerau-Levenshtein (alineación óptima): cuenta
+ * inserciones, borrados, sustituciones y transposiciones de letras
+ * adyacentes. La transposición vale 1 porque es el error de dedo más
+ * común al teclear (FORM por FROM, SELCET por SELECT).
+ */
+function levenshtein(a, b){
+  if(a === b) return 0;
+  if(!a.length) return b.length;
+  if(!b.length) return a.length;
+
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const d = [];
+  for(let i = 0; i < rows; i++){
+    d.push(new Array(cols).fill(0));
+    d[i][0] = i;
+  }
+  for(let j = 0; j < cols; j++) d[0][j] = j;
+
+  for(let i = 1; i < rows; i++){
+    for(let j = 1; j < cols; j++){
+      const cost = a[i-1] === b[j-1] ? 0 : 1;
+      d[i][j] = Math.min(
+        d[i-1][j] + 1,        // borrado
+        d[i][j-1] + 1,        // inserción
+        d[i-1][j-1] + cost    // sustitución
+      );
+      if(i > 1 && j > 1 && a[i-1] === b[j-2] && a[i-2] === b[j-1]){
+        d[i][j] = Math.min(d[i][j], d[i-2][j-2] + 1);  // transposición
+      }
+    }
+  }
+  return d[a.length][b.length];
+}
+
+/**
  * Reemplaza el contenido de strings ('...') y comentarios (-- y bloque)
  * por espacios, conservando el largo y los saltos de línea.
  */
@@ -366,7 +442,7 @@ function cleanSql(raw, findings){
         break;
 
       case STATE.STRING:
-        if(ch === "'" && next === "'"){ out += '  '; i += 2; }        // '' escapada
+        if(ch === "'" && next === "'"){ out += '  '; i += 2; }
         else if(ch === "'"){ state = STATE.NORMAL; out += "'"; i++; }
         else { out += (ch === '\n' ? '\n' : ' '); i++; }
         break;
@@ -385,14 +461,14 @@ function cleanSql(raw, findings){
 
   if(state === STATE.STRING){
     findings.push({
-      severity: SEVERITY.CRITICAL,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'Comilla simple sin cerrar',
       detail: 'Hay un literal de texto que no se cierra correctamente. Esto provocará un error de sintaxis al ejecutar el script.'
     });
   }
   if(state === STATE.BLOCK_COMMENT){
     findings.push({
-      severity: SEVERITY.CRITICAL,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'Comentario de bloque sin cerrar (/* ... */)',
       detail: 'Falta el cierre */ de un comentario. Puede "comerse" parte de la sentencia sin que se note a simple vista.'
     });
@@ -413,14 +489,14 @@ function checkParenBalance(clean, findings){
   }
   if(depth > 0){
     findings.push({
-      severity: SEVERITY.CRITICAL,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: depth === 1 ? 'Falta 1 paréntesis por cerrar' : `Faltan ${depth} paréntesis por cerrar`,
       detail: 'El desbalance de paréntesis hará que el motor de base de datos rechace la sentencia.'
     });
   }
   if(extraClosers > 0){
     findings.push({
-      severity: SEVERITY.CRITICAL,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: extraClosers === 1 ? 'Sobra 1 paréntesis de cierre' : `Sobran ${extraClosers} paréntesis de cierre`,
       detail: 'Hay paréntesis de cierre sin su apertura correspondiente; el motor rechazará la sentencia.'
     });
@@ -507,9 +583,9 @@ function fieldsAsTags(cleanSlice, origSlice){
 }
 
 /**
- * Aplica una lista de correcciones {start, end, replacement} sobre un
- * texto y devuelve la versión corregida en texto plano y en HTML con
- * los cambios resaltados. Los rangos no deben traslaparse.
+ * Aplica correcciones {start, end, replacement} sobre un texto y
+ * devuelve la versión corregida en texto plano y en HTML con los
+ * cambios resaltados. Los rangos no deben traslaparse.
  */
 function applyFixes(sourceText, fixes){
   const sorted = [...fixes].sort((a,b) => a.start - b.start);
@@ -530,17 +606,120 @@ function applyFixes(sourceText, fixes){
   return { text: plain, html };
 }
 
+/* ---------- Detección de palabras clave mal escritas ---------- */
+
+/** Primer carácter que no es espacio antes de la posición dada. */
+function prevNonSpace(text, index){
+  for(let i = index - 1; i >= 0; i--){
+    if(!/\s/.test(text[i])) return { char:text[i], index:i };
+  }
+  return { char:'', index:-1 };
+}
+
+/** Primer carácter que no es espacio a partir de la posición dada. */
+function nextNonSpace(text, index){
+  for(let i = index; i < text.length; i++){
+    if(!/\s/.test(text[i])) return { char:text[i], index:i };
+  }
+  return { char:'', index:-1 };
+}
+
+/** Palabra completa que termina en la posición dada (o cadena vacía). */
+function wordEndingAt(text, index){
+  if(index < 0) return '';
+  let end = index + 1;
+  let start = end;
+  while(start > 0 && /[A-Za-z_]/.test(text[start-1])) start--;
+  return text.slice(start, end);
+}
+
+/**
+ * Busca tokens que se parecen a una palabra clave pero están mal
+ * escritos. Aplica guardas para no confundir nombres de tablas o
+ * columnas (que aparecen en posiciones donde se espera un identificador).
+ * @returns {Array<{start:number,end:number,token:string,suggestion:string}>}
+ */
+function detectKeywordTypos(clean){
+  const keywordSet = new Set(STRUCTURAL_KEYWORDS);
+  const typos = [];
+  const tokenRe = /[A-Za-z_]{4,}/g;
+  let m;
+
+  while((m = tokenRe.exec(clean)) !== null){
+    const token = m[0];
+    const upper = token.toUpperCase();
+    if(keywordSet.has(upper)) continue;
+    if(token.includes('_')) continue;              // los nombres con _ son identificadores
+
+    // Mejor candidato por distancia de edición.
+    let best = null;
+    for(const keyword of STRUCTURAL_KEYWORDS){
+      if(Math.abs(keyword.length - upper.length) > 2) continue;
+      const limit = keyword.length >= 7 ? 2 : 1;
+      const distance = levenshtein(upper, keyword);
+      if(distance <= limit && (!best || distance < best.distance)){
+        best = { keyword, distance };
+      }
+    }
+    if(!best) continue;
+
+    // Guardas por contexto: descarta posiciones donde se espera un
+    // identificador (tabla, columna, alias) y no una palabra clave.
+    const before = prevNonSpace(clean, m.index);
+    const after = nextNonSpace(clean, m.index + token.length);
+    if(before.char === ',' || before.char === '.' || before.char === '(') continue;
+    if(after.char === ',' || after.char === '.') continue;
+    // Un '(' después suele indicar llamada a función, salvo en VALUES (...).
+    if(after.char === '(' && best.keyword !== 'VALUES') continue;
+    if('=<>!+-/|%'.includes(after.char)) continue;
+    if(/[A-Za-z_]/.test(before.char)){
+      const prevWord = wordEndingAt(clean, before.index).toUpperCase();
+      if(IDENTIFIER_PREDECESSORS.has(prevWord)) continue;
+    }
+
+    // Conserva el estilo de mayúsculas del texto original.
+    const isLower = token === token.toLowerCase();
+    typos.push({
+      start: m.index,
+      end: m.index + token.length,
+      token,
+      suggestion: isLower ? best.keyword.toLowerCase() : best.keyword
+    });
+  }
+  return typos;
+}
+
+/**
+ * Reescribe el texto aplicando las correcciones de palabras clave y
+ * devuelve el texto reparado junto con los rangos ya corregidos
+ * (en coordenadas del texto reparado) para poder resaltarlos.
+ */
+function repairTypos(text, typos){
+  let repaired = '';
+  let pos = 0;
+  let delta = 0;
+  const highlights = [];
+  for(const typo of typos){
+    repaired += text.slice(pos, typo.start) + typo.suggestion;
+    const newStart = typo.start + delta;
+    highlights.push({ start:newStart, end:newStart + typo.suggestion.length, replacement:typo.suggestion });
+    delta += typo.suggestion.length - (typo.end - typo.start);
+    pos = typo.end;
+  }
+  repaired += text.slice(pos);
+  return { repaired, highlights };
+}
+
 /* ---------- Chequeos compartidos ---------- */
 
 function makeNoWhereFinding(keyword){
   return {
-    severity: SEVERITY.CRITICAL,
+    kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
     title: `${keyword} sin cláusula WHERE`,
     detail: 'Esta sentencia afectará TODAS las filas de la tabla al ejecutarse en productivo. Si no es intencional, agrega una condición WHERE que delimite los registros.'
   };
 }
 
-/** Marca al final de la sentencia el punto donde falta el WHERE. */
 function pushMissingWherePlaceholder(original, fixes){
   const insertAt = original.replace(/\s+$/,'').length;
   fixes.push({ start: insertAt, end: insertAt, replacement: ' /* FALTA: condición WHERE que delimite los registros */' });
@@ -548,13 +727,11 @@ function pushMissingWherePlaceholder(original, fixes){
 
 /**
  * Detecta comas a nivel superior dentro del WHERE. Una lista de valores
- * después de '=' (campo = v1, v2, v3) es error de sintaxis: se sugiere
- * IN (...). Cualquier otra coma suelta también se reporta.
+ * después de '=' es error de sintaxis: se sugiere IN (...).
  */
 function checkWhereValueLists(clean, original, whereStart, whereEnd, findings, fixes){
   const depthAt = buildDepthMap(clean);
 
-  // Separadores AND / OR a nivel superior dentro del rango del WHERE.
   const seps = [];
   const sepRe = /\b(AND|OR)\b/gi;
   let m;
@@ -569,28 +746,25 @@ function checkWhereValueLists(clean, original, whereStart, whereEnd, findings, f
     const segStart = bounds[s];
     const segEnd = bounds[s+1];
 
-    // Primera coma a nivel superior dentro del tramo.
     let commaIdx = -1;
     for(let i = segStart; i < segEnd; i++){
       if(clean[i] === ',' && depthAt[i] === 0){ commaIdx = i; break; }
     }
     if(commaIdx === -1) continue;
 
-    // Buscar el '=' (comparación simple) antes de la coma.
     let eqIdx = -1;
     for(let i = commaIdx - 1; i >= segStart; i--){
       if(depthAt[i] !== 0) continue;
       const ch = clean[i];
       if(ch === '='){
         const prev = clean[i-1];
-        if(prev === '<' || prev === '>' || prev === '!') break; // <=, >=, != no aplican
+        if(prev === '<' || prev === '>' || prev === '!') break;
         eqIdx = i;
         break;
       }
       if(ch === '<' || ch === '>' || ch === '!') break;
     }
 
-    // Fin del listado de valores: último carácter no-espacio del tramo.
     let valuesEnd = segEnd;
     while(valuesEnd > segStart && /\s/.test(clean[valuesEnd-1])) valuesEnd--;
 
@@ -606,14 +780,15 @@ function checkWhereValueLists(clean, original, whereStart, whereEnd, findings, f
         replacement: `${needSpace ? ' ' : ''}IN (${values})`
       });
       findings.push({
-        severity: SEVERITY.CRITICAL,
-        title: "Lista de valores con '=' en lugar de IN (...)",
-        detail: `Después de '=' solo puede ir un valor; tal como está, el motor marcará error de sintaxis. Para comparar contra varios valores usa: ${fieldName} IN (${values}).`
+        kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
+        title: "Condición mal formada: lista de valores con '=' en lugar de IN (...)",
+        detail: `Después de '=' solo puede ir un valor; tal como está, el motor marcará error de sintaxis. Para comparar contra varios valores usa IN.`,
+        where: `${fieldName} IN (${values})`
       });
     } else if(!genericReported){
       genericReported = true;
       findings.push({
-        severity: SEVERITY.CRITICAL,
+        kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
         title: 'Coma inesperada en la condición WHERE',
         detail: 'Las condiciones del WHERE se combinan con AND / OR, o con listas de valores dentro de IN (...). Una coma suelta a este nivel provocará un error de sintaxis.'
       });
@@ -628,15 +803,15 @@ function checkNullComparisons(clean, findings, fixes){
   let reported = false;
   while((m = re.exec(clean)) !== null){
     const op = m[1];
-    if(op === '<' || op === '>' || op === '<=' || op === '>=') continue; // comparaciones de orden: raras, no auto-corregibles
-    const replacement = (op === '=' ) ? 'IS NULL' : 'IS NOT NULL';
+    if(op === '<' || op === '>' || op === '<=' || op === '>=') continue;
+    const replacement = (op === '=') ? 'IS NULL' : 'IS NOT NULL';
     fixes.push({ start: m.index, end: m.index + m[0].length, replacement });
     if(!reported){
       reported = true;
       findings.push({
-        severity: SEVERITY.WARNING,
-        title: 'Comparación directa contra NULL',
-        detail: 'Una condición como "campo = NULL" nunca es verdadera en SQL estándar. Usa IS NULL o IS NOT NULL.'
+        kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
+        title: 'Condición mal formada: comparación directa contra NULL',
+        detail: 'Una condición como "campo = NULL" nunca es verdadera en SQL estándar, así que la sentencia no traerá ni afectará los registros esperados. Debe escribirse con IS NULL o IS NOT NULL.'
       });
     }
   }
@@ -648,9 +823,9 @@ function parseSelect(clean, original, info, findings, fixes){
   const fromMatches = topLevelMatches(clean, /\bFROM\b/i);
   if(!fromMatches.length){
     findings.push({
-      severity: SEVERITY.WARNING,
-      title: 'No se encontró FROM en el SELECT',
-      detail: 'Verifica que la sentencia esté completa.'
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
+      title: 'No se encontró la cláusula FROM',
+      detail: 'Un SELECT sobre tablas requiere FROM para indicar de dónde se toman los datos. Verifica que la sentencia esté completa y bien escrita.'
     });
     return;
   }
@@ -674,7 +849,7 @@ function parseSelect(clean, original, info, findings, fixes){
     const isCross = /\bCROSS\s*$/i.test(fromTextClean.slice(0, jm.index));
     if(!isCross && !/\b(ON|USING)\b/i.test(joinSegment)){
       findings.push({
-        severity: SEVERITY.CRITICAL,
+        kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
         title: 'JOIN sin condición ON/USING',
         detail: 'Se detectó un JOIN sin condición de enlace visible. Esto puede generar un producto cartesiano (multiplicación de filas) en producción.'
       });
@@ -691,17 +866,17 @@ function parseSelect(clean, original, info, findings, fixes){
   } else {
     info.where = '(sin condición)';
     findings.push({
-      severity: SEVERITY.WARNING,
-      title: 'SELECT sin cláusula WHERE',
-      detail: 'La consulta devolverá todas las filas de la(s) tabla(s). Confirma que sea intencional, especialmente si la tabla es grande.'
+      kind: KIND.ADVICE, severity: SEVERITY.WARNING,
+      title: 'La consulta no tiene condición WHERE',
+      detail: 'Sin WHERE la consulta devolverá todas las filas de la tabla. Si es a propósito está bien, pero en tablas grandes puede tardar mucho o saturar la sesión. Si buscas registros específicos, agrega una condición.'
     });
   }
 
   if(/\bSELECT\s+(?:\w+\s*\.\s*)?\*/i.test(clean.slice(0, fromIdx))){
     findings.push({
-      severity: SEVERITY.WARNING,
-      title: 'Uso de SELECT *',
-      detail: 'Listar explícitamente los campos necesarios evita traer columnas de más y hace el script más fácil de leer y mantener.'
+      kind: KIND.ADVICE, severity: SEVERITY.WARNING,
+      title: 'Estás usando * en la selección de campos',
+      detail: 'Con * la consulta traerá todas las columnas de la tabla, incluidas las que no necesites. Si es lo que buscas, adelante; si solo requieres algunos campos, listarlos por nombre hace la consulta más rápida, más clara y evita que se rompa si la tabla cambia de estructura.'
     });
   }
 }
@@ -717,9 +892,9 @@ function parseUpdate(clean, original, info, findings, fixes){
 
   if(!setMatches.length){
     findings.push({
-      severity: SEVERITY.CRITICAL,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'UPDATE sin cláusula SET',
-      detail: 'La sentencia no indica qué columnas actualizar; el motor la rechazará. Verifica que esté completa.'
+      detail: 'La sentencia no indica qué columnas actualizar; el motor la rechazará. Verifica que esté completa y bien escrita.'
     });
   } else {
     const setStart = setMatches[0].index + 'SET'.length;
@@ -769,14 +944,13 @@ function parseInsert(clean, original, info, findings, fixes){
 
   if(!intoMatch){
     findings.push({
-      severity: SEVERITY.WARNING,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'INSERT sin cláusula INTO',
-      detail: 'No se identificó la tabla destino. Verifica que la sentencia esté completa.'
+      detail: 'No se identificó la tabla destino. Verifica que la sentencia esté completa y bien escrita.'
     });
     return;
   }
 
-  // La tabla es el primer identificador después de INTO (admite esquema.tabla).
   const afterInto = intoMatch.index + 'INTO'.length;
   const tableMatch = clean.slice(afterInto, sourceIdx).match(/[A-Za-z_"\[][\w."$#\]\[]*/);
   if(!tableMatch){
@@ -787,8 +961,6 @@ function parseInsert(clean, original, info, findings, fixes){
   const tableEnd = tableStart + tableMatch[0].length;
   info.tables = original.slice(tableStart, tableEnd);
 
-  // Lo que queda entre la tabla y VALUES/SELECT debe ser la lista de
-  // columnas entre paréntesis, o nada.
   const restClean = clean.slice(tableEnd, sourceIdx);
   const restTrimmed = restClean.trim();
 
@@ -799,24 +971,24 @@ function parseInsert(clean, original, info, findings, fixes){
       info.fields = fieldsAsTags(clean.slice(openParen+1, closeParen), original.slice(openParen+1, closeParen)) || '(vacío)';
     }
   } else if(restTrimmed.length){
-    // Columnas presentes pero sin paréntesis: error de sintaxis.
     const colStart = tableEnd + (restClean.length - restClean.trimStart().length);
     const colEnd = tableEnd + restClean.replace(/\s+$/,'').length;
     const columnsText = collapseSpaces(original.slice(colStart, colEnd));
 
     info.fields = fieldsAsTags(clean.slice(colStart, colEnd), original.slice(colStart, colEnd)) || '(vacío)';
     findings.push({
-      severity: SEVERITY.CRITICAL,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'Lista de columnas sin paréntesis',
-      detail: `En un INSERT, las columnas deben ir entre paréntesis después del nombre de la tabla: ${collapseSpaces(info.tables)} (${columnsText}) VALUES (...). Tal como está, el motor marcará error de sintaxis.`
+      detail: 'En un INSERT, las columnas deben ir entre paréntesis después del nombre de la tabla. Tal como está, el motor marcará error de sintaxis.',
+      where: `${collapseSpaces(info.tables)} (${columnsText}) VALUES (...)`
     });
     fixes.push({ start: colStart, end: colEnd, replacement: `(${columnsText})` });
   } else {
     info.fields = '(no se listaron columnas explícitamente)';
     findings.push({
-      severity: SEVERITY.WARNING,
-      title: 'INSERT sin lista explícita de columnas',
-      detail: 'Si la estructura de la tabla cambia (se agrega/elimina una columna), este script fallará o insertará datos en la columna equivocada. Se recomienda declarar las columnas explícitamente.'
+      kind: KIND.ADVICE, severity: SEVERITY.WARNING,
+      title: 'El INSERT no lista las columnas',
+      detail: 'Al no declarar columnas, los valores se insertan en el orden físico de la tabla. Si mañana se agrega o elimina una columna, el script fallará o guardará el dato en la columna equivocada. Declararlas explícitamente lo hace a prueba de cambios.'
     });
   }
 }
@@ -828,7 +1000,7 @@ function parseDestructive(lead, original, info, findings){
   info.fields = '(no aplica)';
   info.where = '(operación irreversible, no admite condición)';
   findings.push({
-    severity: SEVERITY.CRITICAL,
+    kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
     title: `Operación ${lead} detectada`,
     detail: 'Es una operación destructiva e irreversible sobre la estructura o el total de los datos de la tabla. Verifica dos veces el nombre del objeto antes de ejecutar en productivo.'
   });
@@ -840,37 +1012,51 @@ function parseMerge(clean, info, findings){
   const hasNotMatched = /\bWHEN\s+NOT\s+MATCHED\b/i.test(clean);
   if(!hasMatched && !hasNotMatched){
     findings.push({
-      severity: SEVERITY.WARNING,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'MERGE sin cláusulas WHEN MATCHED / WHEN NOT MATCHED',
-      detail: 'Verifica que la sentencia esté completa; un MERGE normalmente requiere al menos una de estas cláusulas.'
+      detail: 'Un MERGE requiere al menos una de estas cláusulas para saber qué hacer con las filas. Verifica que la sentencia esté completa.'
     });
   }
 }
 
 /**
- * Analiza una sentencia individual. Devuelve metadatos + fixes con
- * índices relativos a sourceText (la sentencia original recortada),
- * o null si no se reconoció nada.
+ * Analiza una sentencia individual sobre su versión reparada.
+ * Devuelve metadatos + fixes con índices relativos a sourceText.
  */
 function parseStatement(segment, findings){
-  const trimmedClean = segment.clean.trim();
-  if(!trimmedClean) return null;
+  if(!segment.clean.trim()) return null;
 
+  // 1. Corregir palabras clave mal escritas antes de interpretar.
+  const typos = detectKeywordTypos(segment.clean);
+  const { repaired, highlights } = repairTypos(segment.original, typos);
+
+  typos.forEach(typo => {
+    findings.push({
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
+      title: `Palabra clave mal escrita: "${typo.token}"`,
+      detail: `No es una instrucción SQL válida y el motor rechazará la sentencia. Parece que quisiste escribir ${typo.suggestion.toUpperCase()}.`,
+      where: `${typo.token}  →  ${typo.suggestion}`
+    });
+  });
+
+  // 2. Trabajar sobre el texto reparado (índices realineados).
+  let clean = cleanSql(repaired, []);
+  let original = repaired;
+
+  const trimmedClean = clean.trim();
   const leadMatch = trimmedClean.match(/^\s*(WITH|SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)\b/i);
   if(!leadMatch){
     const preview = collapseSpaces(segment.original).slice(0, 60);
     findings.push({
-      severity: SEVERITY.INFO,
-      title: 'Sentencia no reconocida',
-      detail: `No se identificó un tipo de instrucción SQL estándar al inicio: "${preview}${preview.length >= 60 ? '…' : ''}"`
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
+      title: 'No se reconoce la instrucción inicial',
+      detail: `La sentencia debe comenzar con una instrucción válida (SELECT, INSERT, UPDATE, DELETE, MERGE...). Se encontró: "${preview}${preview.length >= 60 ? '…' : ''}"`
     });
     return null;
   }
 
   let lead = leadMatch[1].toUpperCase();
-  let clean = segment.clean;
-  let original = segment.original;
-  let shift = 0;         // desplazamiento aplicado por CTE
+  let shift = 0;
   let cteNote = null;
 
   if(lead === 'WITH'){
@@ -885,7 +1071,7 @@ function parseStatement(segment, findings){
   }
 
   const info = { type:lead, tables:'—', fields:'—', where:'—', cte:cteNote };
-  const fixes = [];  // índices relativos a `original` (desplazado por CTE)
+  const fixes = [];
 
   switch(lead){
     case 'SELECT':   parseSelect(clean, original, info, findings, fixes); break;
@@ -898,24 +1084,22 @@ function parseStatement(segment, findings){
     default:
       info.tables = '(no aplica para este tipo de sentencia)';
       findings.push({
-        severity: SEVERITY.INFO,
+        kind: KIND.ADVICE, severity: SEVERITY.INFO,
         title: `Sentencia de tipo ${lead}`,
-        detail: 'Este tipo de sentencia (DDL / permisos) generalmente requiere revisión manual del DBA antes de ejecutarse en productivo.'
+        detail: 'Este tipo de sentencia (DDL / permisos) modifica estructura o accesos, no datos. Generalmente requiere revisión manual del DBA antes de ejecutarse en productivo.'
       });
   }
 
   checkNullComparisons(clean, findings, fixes);
 
-  // Mapear los índices de los fixes al texto de la sentencia recortada
-  // (sourceText): se suma el desplazamiento por CTE y se resta el
-  // espacio en blanco inicial del segmento.
-  const lead0 = segment.original.length - segment.original.trimStart().length;
-  info.sourceText = segment.original.trim();
-  info.fixes = fixes.map(f => ({
-    start: Math.max(0, f.start + shift - lead0),
-    end: Math.max(0, f.end + shift - lead0),
-    replacement: f.replacement
-  }));
+  // 3. Alinear los fixes al texto que se mostrará (sentencia reparada
+  //    y recortada) y sumar los resaltados de palabras corregidas.
+  const lead0 = repaired.length - repaired.trimStart().length;
+  info.sourceText = repaired.trim();
+  info.fixes = [
+    ...highlights.map(h => ({ start:h.start - lead0, end:h.end - lead0, replacement:h.replacement })),
+    ...fixes.map(f => ({ start:f.start + shift - lead0, end:f.end + shift - lead0, replacement:f.replacement }))
+  ].map(f => ({ start: Math.max(0, f.start), end: Math.max(0, f.end), replacement: f.replacement }));
 
   return info;
 }
@@ -925,8 +1109,8 @@ function runDialectChecks(clean, dialect, findings){
   for(const check of checks){
     if(check.re.test(clean)){
       findings.push({
-        severity: SEVERITY.WARNING,
-        title: `Sintaxis de otro motor detectada (dialecto: ${DIALECT_LABEL[dialect]})`,
+        kind: KIND.ADVICE, severity: SEVERITY.WARNING,
+        title: `Sintaxis de otro motor (dialecto seleccionado: ${DIALECT_LABEL[dialect]})`,
         detail: check.hint
       });
     }
@@ -950,9 +1134,9 @@ function analyze(raw, dialect){
 
   if(segments.length > 1){
     findings.push({
-      severity: SEVERITY.WARNING,
-      title: `Se detectaron ${segments.length} sentencias en el mismo bloque`,
-      detail: 'Ejecutar y validar cada sentencia por separado en productivo reduce el riesgo de que un error en una arrastre a las demás.'
+      kind: KIND.ADVICE, severity: SEVERITY.WARNING,
+      title: `El bloque contiene ${segments.length} sentencias`,
+      detail: 'Se validaron todas, pero ejecutarlas y revisarlas una por una en productivo reduce el riesgo de que un error en la primera arrastre a las demás.'
     });
   }
 
@@ -963,9 +1147,9 @@ function analyze(raw, dialect){
   const lastSegment = segments[segments.length - 1];
   if(lastSegment && lastSegment.missingSemicolon){
     findings.push({
-      severity: SEVERITY.INFO,
-      title: 'Falta el punto y coma final ( ; )',
-      detail: 'Algunos ejecutores de scripts en productivo requieren que cada sentencia termine en punto y coma.'
+      kind: KIND.ADVICE, severity: SEVERITY.INFO,
+      title: 'La sentencia no termina en punto y coma',
+      detail: 'Muchos ejecutores de scripts requieren el ; final para saber dónde termina cada instrucción. Agregarlo evita errores al correr el script completo.'
     });
     const lastStatement = statements[statements.length - 1];
     if(lastStatement){
@@ -976,7 +1160,7 @@ function analyze(raw, dialect){
 
   if(statements.length === 0 && !findings.some(f => f.severity === SEVERITY.CRITICAL)){
     findings.push({
-      severity: SEVERITY.INFO,
+      kind: KIND.REVIEW, severity: SEVERITY.CRITICAL,
       title: 'No se reconoció ninguna sentencia',
       detail: 'Verifica que el texto contenga una instrucción SQL válida (SELECT, INSERT, UPDATE, DELETE, etc.).'
     });
@@ -984,7 +1168,6 @@ function analyze(raw, dialect){
 
   runDialectChecks(clean, dialect, findings);
 
-  // Sugerencias de corrección: solo para sentencias con fixes.
   const suggestions = [];
   statements.forEach((statement, index) => {
     if(statement.fixes.length){
@@ -999,9 +1182,9 @@ function analyze(raw, dialect){
     }
   });
 
-  const hasCritical = findings.some(f => f.severity === SEVERITY.CRITICAL);
-  const hasWarning  = findings.some(f => f.severity === SEVERITY.WARNING);
-  const stamp = hasCritical ? 'crit' : (hasWarning ? 'warn' : 'ok');
+  const hasReview = findings.some(f => f.kind === KIND.REVIEW);
+  const hasAdvice = findings.some(f => f.kind === KIND.ADVICE);
+  const stamp = hasReview ? 'crit' : (hasAdvice ? 'warn' : 'ok');
 
   return { findings, statements, suggestions, stamp };
 }
@@ -1033,7 +1216,7 @@ function renderStatement(statement, index, total){
     html += `<div class="stmt-head">Sentencia ${index + 1} — ${escapeHtml(statement.type)}</div>`;
   }
   if(statement.cte){
-    html += `<p class="cte-note">${escapeHtml(statement.cte)}</p>`;
+    html += `<p class="note">${escapeHtml(statement.cte)}</p>`;
   }
   html += `<div class="meta-grid">
     <div class="meta-card"><div class="k">Tipo de sentencia</div><div class="v">${escapeHtml(statement.type)}</div></div>
@@ -1045,19 +1228,30 @@ function renderStatement(statement, index, total){
 }
 
 function renderFinding(finding){
+  const where = finding.where
+    ? `<div class="finding-where">${escapeHtml(finding.where)}</div>`
+    : '';
   return `<div class="finding ${finding.severity}">
     <div class="sev" aria-hidden="true"></div>
     <div class="finding-body">
       <div class="finding-title">${escapeHtml(finding.title)}</div>
       <div class="finding-detail">${escapeHtml(finding.detail)}</div>
+      ${where}
     </div>
   </div>`;
 }
 
+function renderFindingSection(title, cssClass, findings){
+  if(!findings.length) return '';
+  const sorted = [...findings].sort((a,b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
+  return `<h2 class="section-head ${cssClass}"><span class="dot" aria-hidden="true"></span>${title} (${sorted.length})</h2>`
+    + sorted.map(renderFinding).join('');
+}
+
 function renderSuggestions(suggestions){
   if(!suggestions.length) return '';
-  let html = `<h2 class="findings-title">Sugerencia de corrección</h2>`;
-  html += `<p class="cte-note">Los fragmentos resaltados indican la corrección aplicada o lo que falta y en qué punto de la sentencia. Revisa la sugerencia antes de usarla.</p>`;
+  let html = `<h2 class="section-head fix"><span class="dot" aria-hidden="true"></span>Sentencia corregida</h2>`;
+  html += `<p class="note">Los fragmentos resaltados son las correcciones aplicadas o lo que falta y en qué punto va. Revísala antes de usarla.</p>`;
   suggestions.forEach((s, i) => {
     const head = s.total > 1 ? `<div class="stmt-head">Sentencia ${s.index + 1} — ${escapeHtml(s.type)}</div>` : '';
     html += `<div class="suggestion-wrap">${head}
@@ -1078,16 +1272,18 @@ function renderReport(report){
     .map((statement, idx) => renderStatement(statement, idx, report.statements.length))
     .join('');
 
-  if(report.findings.length){
-    const sorted = [...report.findings].sort((a,b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
-    html += `<h2 class="findings-title">Hallazgos (${sorted.length})</h2>`;
-    html += sorted.map(renderFinding).join('');
-  } else {
-    html += `<h2 class="findings-title">Hallazgos</h2>`;
+  const review = report.findings.filter(f => f.kind === KIND.REVIEW);
+  const advice = report.findings.filter(f => f.kind === KIND.ADVICE);
+
+  html += renderFindingSection('Requiere revisión', 'review', review);
+  html += renderFindingSection('Advertencias y recomendaciones', 'advice', advice);
+
+  if(!review.length && !advice.length){
+    html += `<h2 class="section-head clear"><span class="dot" aria-hidden="true"></span>Sentencia correcta</h2>`;
     html += renderFinding({
-      severity: SEVERITY.INFO,
-      title: 'No se detectaron observaciones estructurales',
-      detail: 'Revisa igualmente la lógica de negocio de la sentencia; este análisis solo cubre riesgos estructurales comunes.'
+      severity: 'ok',
+      title: 'No se detectaron errores ni observaciones',
+      detail: 'La estructura de la sentencia es válida y no se encontraron riesgos comunes para productivo. Revisa igualmente la lógica de negocio: este análisis no valida nombres de tablas, columnas ni los datos.'
     });
   }
 
@@ -1100,15 +1296,10 @@ function renderReport(report){
 function copyToClipboard(text, button){
   const restore = () => { setTimeout(() => { button.textContent = 'Copiar'; }, 1500); };
   if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(() => {
-      button.textContent = 'Copiado';
-      restore();
-    }).catch(() => {
-      button.textContent = 'Error';
-      restore();
-    });
+    navigator.clipboard.writeText(text)
+      .then(() => { button.textContent = 'Copiado'; restore(); })
+      .catch(() => { button.textContent = 'Error'; restore(); });
   } else {
-    // Respaldo para contextos sin Clipboard API (http, navegadores viejos).
     const helper = document.createElement('textarea');
     helper.value = text;
     helper.style.position = 'fixed';
@@ -1157,8 +1348,7 @@ ui.dialectBar.addEventListener('click', handleDialectClick);
 ui.results.addEventListener('click', (event) => {
   const button = event.target.closest('[data-copy-idx]');
   if(!button) return;
-  const text = lastSuggestions[Number(button.dataset.copyIdx)] || '';
-  copyToClipboard(text, button);
+  copyToClipboard(lastSuggestions[Number(button.dataset.copyIdx)] || '', button);
 });
 ui.input.addEventListener('input', () => {
   ui.charCount.textContent = `${ui.input.value.length} caracteres`;
@@ -1174,7 +1364,7 @@ renderEmpty();
 
 // Expuesto solo para pruebas automatizadas (no forma parte de la UI).
 if(typeof window !== 'undefined'){
-  window.__sqlValidator = { analyze, applyFixes };
+  window.__sqlValidator = { analyze, applyFixes, detectKeywordTypos, levenshtein };
 }
 
 })();
