@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Validador estructural de sentencias SQL previo a ejecución en producción">
+<title>Validador de Sentencias SQL</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root{
+  --bg:#0F141F;
+  --panel:#151C2B;
+  --panel-2:#1B2436;
+  --border:#26314A;
+  --text:#E7ECF3;
+  --muted:#7C8AA3;
+  --accent:#35D0BA;
+  --accent-dim:#1E5F58;
+  --critical:#FF5C72;
+  --critical-dim:#3D1F27;
+  --warning:#FFB454;
+  --warning-dim:#3D3120;
+  --info:#5AA9FF;
+  --ok:#4ADE80;
+  --ok-dim:#1C3327;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:'Inter',system-ui,sans-serif;
+  min-height:100vh;
+  padding:32px 24px 60px;
+}
+.wrap{max-width:1180px;margin:0 auto;}
+
+header{
+  display:flex;
+  align-items:baseline;
+  justify-content:space-between;
+  gap:16px;
+  margin-bottom:28px;
+  border-bottom:1px solid var(--border);
+  padding-bottom:20px;
+  flex-wrap:wrap;
+}
+.brand{display:flex;align-items:center;gap:12px;}
+.brand-mark{
+  width:34px;height:34px;border-radius:8px;
+  background:linear-gradient(135deg,var(--accent),#1E8F82);
+  display:flex;align-items:center;justify-content:center;
+  font-family:'JetBrains Mono',monospace;font-weight:600;font-size:15px;color:#04211D;
+  flex-shrink:0;
+}
+h1{
+  font-family:'Space Grotesk',sans-serif;
+  font-size:22px;
+  font-weight:600;
+  margin:0;
+  letter-spacing:-0.01em;
+}
+.subtitle{color:var(--muted);font-size:13px;margin-top:2px;}
+
+.dialect-select{
+  display:flex;gap:6px;background:var(--panel-2);border:1px solid var(--border);
+  border-radius:10px;padding:4px;
+}
+.dialect-select button{
+  font-family:'Inter',sans-serif;font-size:12.5px;font-weight:500;
+  color:var(--muted);background:transparent;border:none;border-radius:7px;
+  padding:7px 12px;cursor:pointer;transition:.15s;
+}
+.dialect-select button[aria-pressed="true"]{background:var(--accent);color:#04211D;}
+.dialect-select button[aria-pressed="false"]:hover{color:var(--text);}
+
+.grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:20px;
+  align-items:start;
+}
+@media (max-width:920px){.grid{grid-template-columns:1fr;}}
+
+.panel{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:14px;
+  overflow:hidden;
+}
+.panel-head{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:14px 18px;border-bottom:1px solid var(--border);
+}
+.panel-head .label{
+  font-family:'JetBrains Mono',monospace;font-size:11.5px;letter-spacing:.06em;
+  color:var(--muted);text-transform:uppercase;
+}
+textarea{
+  display:block;
+  width:100%;min-height:360px;resize:vertical;
+  background:var(--panel);color:var(--text);
+  border:none;outline:none;padding:18px;
+  font-family:'JetBrains Mono',monospace;font-size:13.5px;line-height:1.65;
+}
+textarea::placeholder{color:#3C4A66;}
+textarea:focus-visible{box-shadow:inset 0 0 0 2px var(--accent-dim);}
+
+.actions{
+  display:flex;gap:10px;align-items:center;padding:14px 18px;border-top:1px solid var(--border);
+}
+button.primary{
+  font-family:'Inter',sans-serif;font-weight:600;font-size:13.5px;
+  background:var(--accent);color:#04211D;border:none;border-radius:9px;
+  padding:10px 18px;cursor:pointer;transition:.15s;
+}
+button.primary:hover{background:#4EE1CB;}
+button.ghost{
+  font-family:'Inter',sans-serif;font-weight:500;font-size:13.5px;
+  background:transparent;color:var(--muted);border:1px solid var(--border);
+  border-radius:9px;padding:10px 16px;cursor:pointer;transition:.15s;
+}
+button.ghost:hover{color:var(--text);border-color:#3A4763;}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+.hint{color:var(--muted);font-size:11.5px;margin-left:auto;}
+
+.results{padding:20px;min-height:360px;}
+.empty-state{
+  color:var(--muted);font-size:13.5px;line-height:1.7;
+  display:flex;flex-direction:column;align-items:center;text-align:center;
+  padding:60px 20px;gap:10px;
+}
+.empty-state .glyph{font-family:'JetBrains Mono',monospace;font-size:26px;color:#3C4A66;}
+
+.stamp-row{display:flex;justify-content:center;margin-bottom:22px;}
+.stamp{
+  font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:15px;
+  letter-spacing:.08em;text-transform:uppercase;
+  border:3px solid; border-radius:10px;
+  padding:9px 20px;
+  transform:rotate(-3deg);
+  position:relative;
+}
+.stamp::before{
+  content:'';position:absolute;inset:4px;border:1px solid;border-color:inherit;
+  border-radius:6px;opacity:.5;
+}
+.stamp.ok{color:var(--ok);border-color:var(--ok);background:var(--ok-dim);}
+.stamp.warn{color:var(--warning);border-color:var(--warning);background:var(--warning-dim);}
+.stamp.crit{color:var(--critical);border-color:var(--critical);background:var(--critical-dim);}
+@media (prefers-reduced-motion: reduce){
+  *{transition:none !important;}
+}
+
+.meta-grid{
+  display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:22px;
+}
+@media (max-width:520px){.meta-grid{grid-template-columns:1fr;}}
+.meta-card{
+  background:var(--panel-2);border:1px solid var(--border);border-radius:10px;
+  padding:12px 14px;
+}
+.meta-card .k{
+  font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;
+}
+.meta-card .v{
+  font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text);
+  word-break:break-word;line-height:1.5;
+}
+.meta-card .v .tag{
+  display:inline-block;background:var(--accent-dim);color:var(--accent);
+  border-radius:5px;padding:1px 7px;margin:2px 4px 2px 0;font-size:12px;
+}
+.meta-card.full{grid-column:1/-1;}
+
+.findings-title{
+  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.06em;margin:20px 0 10px;
+}
+.finding{
+  display:flex;gap:12px;padding:12px 14px;border-radius:10px;
+  border:1px solid var(--border);background:var(--panel-2);margin-bottom:9px;
+}
+.finding .sev{flex-shrink:0;width:8px;border-radius:4px;margin-top:2px;}
+.finding.critical .sev{background:var(--critical);}
+.finding.warning .sev{background:var(--warning);}
+.finding.info .sev{background:var(--info);}
+.finding-body{flex:1;}
+.finding-title{font-size:13.5px;font-weight:600;margin-bottom:3px;}
+.finding.critical .finding-title{color:var(--critical);}
+.finding.warning .finding-title{color:var(--warning);}
+.finding.info .finding-title{color:var(--info);}
+.finding-detail{font-size:12.5px;color:var(--muted);line-height:1.5;}
+.finding-detail code{
+  font-family:'JetBrains Mono',monospace;background:#0F1520;padding:1px 5px;
+  border-radius:4px;color:#C8D3E8;
+}
+
+.stmt-block{margin-bottom:16px;}
+.stmt-block:last-child{margin-bottom:0;}
+.stmt-head{
+  font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--accent);
+  margin-bottom:8px;
+}
+.cte-note{font-size:12.5px;color:var(--muted);line-height:1.5;margin-bottom:10px;}
+
+footer{
+  margin-top:26px;color:var(--muted);font-size:11.5px;text-align:center;line-height:1.6;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">SQL</div>
+      <div>
+        <h1>Validador de Sentencias SQL</h1>
+        <p class="subtitle">Revisión estructural previa a ejecución en producción</p>
+      </div>
+    </div>
+    <div class="dialect-select" id="dialectSelect" role="group" aria-label="Dialecto SQL">
+      <button type="button" data-dialect="generic" aria-pressed="true">Genérico</button>
+      <button type="button" data-dialect="oracle" aria-pressed="false">Oracle</button>
+      <button type="button" data-dialect="tsql" aria-pressed="false">SQL Server</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="panel" aria-labelledby="inputLabel">
+      <div class="panel-head">
+        <label class="label" id="inputLabel" for="sqlInput">Sentencia a validar</label>
+        <span class="label" id="charCount" aria-live="polite">0 caracteres</span>
+      </div>
+      <textarea id="sqlInput" spellcheck="false" autocomplete="off"
+        placeholder="Pega aquí tu sentencia SQL...&#10;&#10;Ejemplo:&#10;UPDATE ALUMNOS SET ESTATUS = 'B' WHERE ID_ALUMNO = 12345;"></textarea>
+      <div class="actions">
+        <button type="button" class="primary" id="validateBtn">Validar sentencia</button>
+        <button type="button" class="ghost" id="clearBtn">Limpiar</button>
+        <span class="hint">Ctrl + Enter para validar</span>
+      </div>
+    </section>
+
+    <section class="panel" aria-label="Diagnóstico">
+      <div class="panel-head">
+        <span class="label">Diagnóstico</span>
+      </div>
+      <div class="results" id="results" role="region" aria-live="polite"></div>
+    </section>
+  </div>
+
+  <footer>
+    Análisis heurístico basado en estructura de texto (no ejecuta la sentencia ni se conecta a ninguna base de datos).<br>
+    No sustituye la revisión de un DBA para cambios críticos.
+  </footer>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ============================================================
+ * Validador de Sentencias SQL
+ * Análisis heurístico de texto: no ejecuta SQL ni se conecta
+ * a ninguna base de datos.
+ *
+ * Diseño general:
+ *  - cleanSql()   "apaga" strings y comentarios conservando el
+ *                 largo del texto, para poder mapear posiciones
+ *                 del texto limpio al texto original.
+ *  - splitStatements() separa sentencias por ';' a nivel superior.
+ *  - parseStatement() extrae metadatos (tipo, tablas, campos,
+ *                 WHERE) y agrega hallazgos por sentencia.
+ *  - Chequeos de dialecto: detectan funciones/sintaxis de otro
+ *                 motor cuando el usuario elige Oracle o T-SQL.
+ * ============================================================ */
+
+/** Niveles de severidad de hallazgos (orden de prioridad al mostrar). */
+const SEVERITY = Object.freeze({ CRITICAL:'critical', WARNING:'warning', INFO:'info' });
+const SEVERITY_ORDER = Object.freeze({ critical:0, warning:1, info:2 });
+
+const STAMP = Object.freeze({
+  ok:   { css:'ok',   label:'Sin observaciones' },
+  warn: { css:'warn', label:'Revisar advertencias' },
+  crit: { css:'crit', label:'Requiere revisión' }
+});
+
+/** Sintaxis ajena a cada dialecto: si el usuario elige Oracle y usa
+ *  funciones de SQL Server (o viceversa), se le advierte. */
+const DIALECT_CHECKS = Object.freeze({
+  oracle: [
+    { re:/\bGETDATE\s*\(/i,       hint:'GETDATE() es de SQL Server; en Oracle usa SYSDATE o SYSTIMESTAMP.' },
+    { re:/\bISNULL\s*\(/i,        hint:'ISNULL() es de SQL Server; en Oracle usa NVL() o COALESCE().' },
+    { re:/\bTOP\s+\d+/i,          hint:'TOP n es de SQL Server; en Oracle usa FETCH FIRST n ROWS ONLY o ROWNUM.' },
+    { re:/\[[A-Za-z_][\w ]*\]/,   hint:'Los corchetes [ ] para nombres son de SQL Server; en Oracle usa comillas dobles o nombres sin delimitar.' },
+    { re:/\bDATEADD\s*\(/i,       hint:'DATEADD() es de SQL Server; en Oracle usa aritmética de fechas o ADD_MONTHS/INTERVAL.' }
+  ],
+  tsql: [
+    { re:/\bSYSDATE\b/i,          hint:'SYSDATE es de Oracle; en SQL Server usa GETDATE() o SYSDATETIME().' },
+    { re:/\bNVL\s*\(/i,           hint:'NVL() es de Oracle; en SQL Server usa ISNULL() o COALESCE().' },
+    { re:/\bROWNUM\b/i,           hint:'ROWNUM es de Oracle; en SQL Server usa TOP n o ROW_NUMBER() OVER (...).' },
+    { re:/\bFROM\s+DUAL\b/i,      hint:'DUAL es de Oracle; en SQL Server el FROM es opcional para expresiones.' },
+    { re:/\bMINUS\b/i,            hint:'MINUS es de Oracle; en SQL Server el operador equivalente es EXCEPT.' },
+    { re:/\bADD_MONTHS\s*\(/i,    hint:'ADD_MONTHS() es de Oracle; en SQL Server usa DATEADD(MONTH, ...).' }
+  ],
+  generic: []
+});
+
+const DIALECT_LABEL = Object.freeze({ oracle:'Oracle', tsql:'SQL Server', generic:'Genérico' });
+
+/* ---------- Utilidades de texto ---------- */
+
+/** Escapa texto para insertarlo de forma segura en HTML. */
+function escapeHtml(value){
+  return String(value)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+/** Colapsa espacios múltiples en uno solo. */
+function collapseSpaces(value){
+  return value.replace(/\s+/g,' ').trim();
+}
+
+/**
+ * Reemplaza el contenido de strings ('...') y comentarios (-- y &sol;* *&sol;)
+ * por espacios, conservando el largo y los saltos de línea. Así los
+ * índices del texto limpio coinciden con los del original.
+ * Agrega hallazgos si detecta strings o comentarios sin cerrar.
+ */
+function cleanSql(raw, findings){
+  const STATE = { NORMAL:0, STRING:1, LINE_COMMENT:2, BLOCK_COMMENT:3 };
+  let state = STATE.NORMAL;
+  let out = '';
+  let i = 0;
+
+  while(i < raw.length){
+    const ch = raw[i];
+    const next = raw[i+1];
+
+    switch(state){
+      case STATE.NORMAL:
+        if(ch === "'"){ state = STATE.STRING; out += ' '; i++; }
+        else if(ch === '-' && next === '-'){ state = STATE.LINE_COMMENT; out += '  '; i += 2; }
+        else if(ch === '/' && next === '*'){ state = STATE.BLOCK_COMMENT; out += '  '; i += 2; }
+        else { out += ch; i++; }
+        break;
+
+      case STATE.STRING:
+        if(ch === "'" && next === "'"){ out += '  '; i += 2; }        // '' escapada
+        else if(ch === "'"){ state = STATE.NORMAL; out += ' '; i++; }
+        else { out += (ch === '\n' ? '\n' : ' '); i++; }
+        break;
+
+      case STATE.LINE_COMMENT:
+        if(ch === '\n'){ state = STATE.NORMAL; out += '\n'; i++; }
+        else { out += ' '; i++; }
+        break;
+
+      case STATE.BLOCK_COMMENT:
+        if(ch === '*' && next === '/'){ state = STATE.NORMAL; out += '  '; i += 2; }
+        else { out += (ch === '\n' ? '\n' : ' '); i++; }
+        break;
+    }
+  }
+
+  if(state === STATE.STRING){
+    findings.push({
+      severity: SEVERITY.CRITICAL,
+      title: 'Comilla simple sin cerrar',
+      detail: 'Hay un literal de texto que no se cierra correctamente. Esto provocará un error de sintaxis al ejecutar el script.'
+    });
+  }
+  if(state === STATE.BLOCK_COMMENT){
+    findings.push({
+      severity: SEVERITY.CRITICAL,
+      title: 'Comentario de bloque sin cerrar (/* ... */)',
+      detail: 'Falta el cierre */ de un comentario. Puede "comerse" parte de la sentencia sin que se note a simple vista.'
+    });
+  }
+
+  return out;
+}
+
+/** Valida el balance de paréntesis sobre el texto limpio. */
+function checkParenBalance(clean, findings){
+  let depth = 0;
+  let extraClosers = 0;
+  for(const ch of clean){
+    if(ch === '(') depth++;
+    else if(ch === ')'){
+      if(depth === 0) extraClosers++;
+      else depth--;
+    }
+  }
+  if(depth > 0){
+    findings.push({
+      severity: SEVERITY.CRITICAL,
+      title: depth === 1 ? 'Falta 1 paréntesis por cerrar' : `Faltan ${depth} paréntesis por cerrar`,
+      detail: 'El desbalance de paréntesis hará que el motor de base de datos rechace la sentencia.'
+    });
+  }
+  if(extraClosers > 0){
+    findings.push({
+      severity: SEVERITY.CRITICAL,
+      title: extraClosers === 1 ? 'Sobra 1 paréntesis de cierre' : `Sobran ${extraClosers} paréntesis de cierre`,
+      detail: 'Hay paréntesis de cierre sin su apertura correspondiente; el motor rechazará la sentencia.'
+    });
+  }
+}
+
+/** Precalcula la profundidad de paréntesis en cada posición del texto. */
+function buildDepthMap(clean){
+  const depthAt = new Array(clean.length);
+  let depth = 0;
+  for(let i = 0; i < clean.length; i++){
+    depthAt[i] = depth;
+    if(clean[i] === '(') depth++;
+    else if(clean[i] === ')') depth = Math.max(0, depth - 1);
+  }
+  return depthAt;
+}
+
+/**
+ * Devuelve las coincidencias de un patrón que ocurren a profundidad 0
+ * de paréntesis (fuera de subconsultas). El patrón se clona para no
+ * depender del estado lastIndex del llamador.
+ */
+function topLevelMatches(clean, pattern){
+  const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
+  const depthAt = buildDepthMap(clean);
+  const matches = [];
+  let m;
+  while((m = re.exec(clean)) !== null){
+    if(depthAt[m.index] === 0) matches.push({ index:m.index, text:m[0] });
+    if(m.index === re.lastIndex) re.lastIndex++;  // evita bucles infinitos con patrones vacíos
+  }
+  return matches;
+}
+
+/** Índice del ')' que cierra el '(' en openIdx, o -1 si no existe. */
+function matchingParen(text, openIdx){
+  let depth = 0;
+  for(let i = openIdx; i < text.length; i++){
+    if(text[i] === '(') depth++;
+    else if(text[i] === ')'){
+      depth--;
+      if(depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** Separa el bloque en sentencias por ';' a profundidad 0. */
+function splitStatements(clean, raw){
+  const segments = [];
+  let depth = 0;
+  let start = 0;
+  for(let i = 0; i < clean.length; i++){
+    const ch = clean[i];
+    if(ch === '(') depth++;
+    else if(ch === ')') depth = Math.max(0, depth - 1);
+    else if(ch === ';' && depth === 0){
+      segments.push({ clean: clean.slice(start,i), original: raw.slice(start,i) });
+      start = i + 1;
+    }
+  }
+  if(raw.slice(start).trim()){
+    segments.push({ clean: clean.slice(start), original: raw.slice(start), missingSemicolon:true });
+  }
+  return segments;
+}
+
+/** Divide por comas a profundidad 0 y devuelve las partes escapadas. */
+function splitTopLevelCommas(cleanSlice, origSlice){
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for(let i = 0; i < cleanSlice.length; i++){
+    const ch = cleanSlice[i];
+    if(ch === '(') depth++;
+    else if(ch === ')') depth = Math.max(0, depth - 1);
+    else if(ch === ',' && depth === 0){
+      parts.push(origSlice.slice(start,i).trim());
+      start = i + 1;
+    }
+  }
+  parts.push(origSlice.slice(start).trim());
+  return parts.filter(p => p.length).map(p => escapeHtml(collapseSpaces(p)));
+}
+
+/**
+ * Convierte una lista separada por comas en HTML de etiquetas.
+ * cleanSlice y origSlice deben corresponder al mismo rango de texto.
+ * Devuelve HTML seguro (las partes se escapan internamente).
+ */
+function fieldsAsTags(cleanSlice, origSlice){
+  const trimmed = origSlice.trim();
+  if(!trimmed) return '';
+  const parts = splitTopLevelCommas(cleanSlice, trimmed);
+  if(!parts.length) return '';
+  return `<span class="tag">${parts.join('</span><span class="tag">')}</span>`;
+}
+
+/* ---------- Análisis por tipo de sentencia ---------- */
+
+/** Crea el hallazgo crítico estándar para UPDATE/DELETE sin WHERE. */
+function makeNoWhereFinding(keyword){
+  return {
+    severity: SEVERITY.CRITICAL,
+    title: `${keyword} sin cláusula WHERE`,
+    detail: 'Esta sentencia afectará TODAS las filas de la tabla al ejecutarse en productivo. Si no es intencional, agrega una condición WHERE que delimite los registros.'
+  };
+}
+
+function parseSelect(clean, original, info, findings){
+  const fromMatches = topLevelMatches(clean, /\bFROM\b/i);
+  if(!fromMatches.length){
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: 'No se encontró FROM en el SELECT',
+      detail: 'Verifica que la sentencia esté completa.'
+    });
+    return;
+  }
+
+  const fromIdx = fromMatches[0].index;
+  const selectIdx = clean.search(/\bSELECT\b/i);
+
+  // Campos seleccionados: entre SELECT y FROM
+  const fieldsStart = selectIdx + 'SELECT'.length;
+  info.fields = fieldsAsTags(clean.slice(fieldsStart, fromIdx), original.slice(fieldsStart, fromIdx)) || '(vacío)';
+
+  // Origen: entre FROM y la siguiente cláusula a nivel superior
+  const afterFrom = clean.slice(fromIdx + 'FROM'.length);
+  const enders = topLevelMatches(afterFrom, /\b(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|UNION|CONNECT\s+BY|FETCH\s+FIRST)\b/i);
+  const fromEnd = enders.length ? fromIdx + 'FROM'.length + enders[0].index : clean.length;
+  const fromTextClean = clean.slice(fromIdx + 'FROM'.length, fromEnd);
+  info.tables = collapseSpaces(original.slice(fromIdx + 'FROM'.length, fromEnd)) || '(no identificada)';
+
+  // JOIN sin ON/USING dentro del FROM (posible producto cartesiano)
+  const joinMatches = topLevelMatches(fromTextClean, /\bJOIN\b/i);
+  joinMatches.forEach((jm, idx) => {
+    const segEnd = idx + 1 < joinMatches.length ? joinMatches[idx+1].index : fromTextClean.length;
+    const joinSegment = fromTextClean.slice(jm.index, segEnd);
+    const isCross = /\bCROSS\s*$/i.test(fromTextClean.slice(0, jm.index));
+    if(!isCross && !/\b(ON|USING)\b/i.test(joinSegment)){
+      findings.push({
+        severity: SEVERITY.CRITICAL,
+        title: 'JOIN sin condición ON/USING',
+        detail: 'Se detectó un JOIN sin condición de enlace visible. Esto puede generar un producto cartesiano (multiplicación de filas) en producción.'
+      });
+    }
+  });
+
+  // WHERE
+  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
+  if(whereMatches.length){
+    const whereStart = whereMatches[0].index + 'WHERE'.length;
+    const afterWhere = topLevelMatches(clean.slice(whereStart), /\b(GROUP\s+BY|ORDER\s+BY|HAVING|UNION|FETCH\s+FIRST)\b/i);
+    const whereEnd = afterWhere.length ? whereStart + afterWhere[0].index : clean.length;
+    info.where = collapseSpaces(original.slice(whereStart, whereEnd)) || '(vacío)';
+  } else {
+    info.where = '(sin condición)';
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: 'SELECT sin cláusula WHERE',
+      detail: 'La consulta devolverá todas las filas de la(s) tabla(s). Confirma que sea intencional, especialmente si la tabla es grande.'
+    });
+  }
+
+  // SELECT * o SELECT alias.*
+  if(/\bSELECT\s+(?:\w+\s*\.\s*)?\*/i.test(clean.slice(0, fromIdx))){
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: 'Uso de SELECT *',
+      detail: 'Listar explícitamente los campos necesarios evita traer columnas de más y hace el script más fácil de leer y mantener.'
+    });
+  }
+}
+
+function parseUpdate(clean, original, info, findings){
+  const updateMatch = clean.match(/\bUPDATE\b/i);
+  const setMatches = topLevelMatches(clean, /\bSET\b/i);
+  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
+
+  const tableStart = updateMatch.index + 'UPDATE'.length;
+  const tableEnd = setMatches.length ? setMatches[0].index : clean.length;
+  info.tables = collapseSpaces(original.slice(tableStart, tableEnd)) || '(no identificada)';
+
+  if(!setMatches.length){
+    findings.push({
+      severity: SEVERITY.CRITICAL,
+      title: 'UPDATE sin cláusula SET',
+      detail: 'La sentencia no indica qué columnas actualizar; el motor la rechazará. Verifica que esté completa.'
+    });
+  } else {
+    const setStart = setMatches[0].index + 'SET'.length;
+    const setEnd = whereMatches.length ? whereMatches[0].index : clean.length;
+    info.fields = fieldsAsTags(clean.slice(setStart, setEnd), original.slice(setStart, setEnd)) || '(vacío)';
+  }
+
+  if(whereMatches.length){
+    info.where = collapseSpaces(original.slice(whereMatches[0].index + 'WHERE'.length)) || '(vacío)';
+  } else {
+    info.where = '(sin condición)';
+    findings.push(makeNoWhereFinding('UPDATE'));
+  }
+}
+
+function parseDelete(clean, original, info, findings){
+  const deleteMatch = clean.match(/\bDELETE\b/i);
+  const fromMatches = topLevelMatches(clean, /\bFROM\b/i);
+  const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
+
+  const tableStart = fromMatches.length
+    ? fromMatches[0].index + 'FROM'.length
+    : deleteMatch.index + 'DELETE'.length;
+  const tableEnd = whereMatches.length ? whereMatches[0].index : clean.length;
+  info.tables = collapseSpaces(original.slice(tableStart, tableEnd)) || '(no identificada)';
+
+  if(whereMatches.length){
+    info.where = collapseSpaces(original.slice(whereMatches[0].index + 'WHERE'.length)) || '(vacío)';
+  } else {
+    info.where = '(sin condición)';
+    findings.push(makeNoWhereFinding('DELETE'));
+  }
+}
+
+function parseInsert(clean, original, info, findings){
+  const intoMatch = clean.match(/\bINTO\b/i);
+  const sourceMatches = topLevelMatches(clean, /\b(VALUES|SELECT)\b/i);
+
+  let columnsParen = intoMatch ? clean.indexOf('(', intoMatch.index) : -1;
+  // Si el primer '(' aparece después de VALUES/SELECT, pertenece a los
+  // valores y no a la lista de columnas.
+  if(columnsParen !== -1 && sourceMatches.length && columnsParen > sourceMatches[0].index){
+    columnsParen = -1;
+  }
+
+  if(intoMatch){
+    const tableEnd = columnsParen !== -1
+      ? columnsParen
+      : (sourceMatches.length ? sourceMatches[0].index : clean.length);
+    info.tables = collapseSpaces(original.slice(intoMatch.index + 'INTO'.length, tableEnd)) || '(no identificada)';
+  } else {
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: 'INSERT sin cláusula INTO',
+      detail: 'No se identificó la tabla destino. Verifica que la sentencia esté completa.'
+    });
+  }
+
+  if(columnsParen !== -1){
+    const closeParen = matchingParen(clean, columnsParen);
+    if(closeParen !== -1){
+      info.fields = fieldsAsTags(clean.slice(columnsParen+1, closeParen), original.slice(columnsParen+1, closeParen)) || '(vacío)';
+    }
+  } else {
+    info.fields = '(no se listaron columnas explícitamente)';
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: 'INSERT sin lista explícita de columnas',
+      detail: 'Si la estructura de la tabla cambia (se agrega/elimina una columna), este script fallará o insertará datos en la columna equivocada. Se recomienda declarar las columnas explícitamente.'
+    });
+  }
+
+  info.where = '(no aplica en INSERT)';
+}
+
+function parseDestructive(lead, original, info, findings){
+  info.tables = collapseSpaces(
+    original.replace(new RegExp('^\\s*' + lead, 'i'), '').replace(/\bTABLE\b/i, '')
+  ) || '(no identificada)';
+  info.fields = '(no aplica)';
+  info.where = '(operación irreversible, no admite condición)';
+  findings.push({
+    severity: SEVERITY.CRITICAL,
+    title: `Operación ${lead} detectada`,
+    detail: 'Es una operación destructiva e irreversible sobre la estructura o el total de los datos de la tabla. Verifica dos veces el nombre del objeto antes de ejecutar en productivo.'
+  });
+}
+
+function parseMerge(clean, info, findings){
+  info.tables = '(sentencia MERGE — revisar manualmente tablas origen/destino)';
+  const hasMatched = /\bWHEN\s+MATCHED\b/i.test(clean);
+  const hasNotMatched = /\bWHEN\s+NOT\s+MATCHED\b/i.test(clean);
+  if(!hasMatched && !hasNotMatched){
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: 'MERGE sin cláusulas WHEN MATCHED / WHEN NOT MATCHED',
+      detail: 'Verifica que la sentencia esté completa; un MERGE normalmente requiere al menos una de estas cláusulas.'
+    });
+  }
+}
+
+/**
+ * Analiza una sentencia individual: identifica su tipo, extrae
+ * metadatos y agrega hallazgos a la lista compartida.
+ * Devuelve el objeto de metadatos, o null si no se reconoció nada.
+ */
+function parseStatement(segment, findings){
+  const trimmedClean = segment.clean.trim();
+  if(!trimmedClean) return null;
+
+  const leadMatch = trimmedClean.match(/^\s*(WITH|SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)\b/i);
+  if(!leadMatch){
+    const preview = collapseSpaces(segment.original).slice(0, 60);
+    findings.push({
+      severity: SEVERITY.INFO,
+      title: 'Sentencia no reconocida',
+      detail: `No se identificó un tipo de instrucción SQL estándar al inicio: "${preview}${preview.length >= 60 ? '…' : ''}"`
+    });
+    return null;
+  }
+
+  let lead = leadMatch[1].toUpperCase();
+  let clean = segment.clean;
+  let original = segment.original;
+  let cteNote = null;
+
+  // Si empieza con WITH, el análisis se aplica a la instrucción
+  // principal después de las CTE. Desplazamos clean y original juntos
+  // para que los índices sigan alineados.
+  if(lead === 'WITH'){
+    const mainKeyword = topLevelMatches(clean, /\b(SELECT|INSERT|UPDATE|DELETE|MERGE)\b/i);
+    if(mainKeyword.length){
+      lead = mainKeyword[0].text.toUpperCase();
+      clean = clean.slice(mainKeyword[0].index);
+      original = original.slice(mainKeyword[0].index);
+      cteNote = 'La sentencia usa una o más CTE (WITH ...). El análisis se aplica a la instrucción principal después de las CTE.';
+    }
+  }
+
+  const info = { type:lead, tables:'—', fields:'—', where:'—', cte:cteNote };
+
+  switch(lead){
+    case 'SELECT':   parseSelect(clean, original, info, findings); break;
+    case 'UPDATE':   parseUpdate(clean, original, info, findings); break;
+    case 'DELETE':   parseDelete(clean, original, info, findings); break;
+    case 'INSERT':   parseInsert(clean, original, info, findings); break;
+    case 'DROP':
+    case 'TRUNCATE': parseDestructive(lead, original, info, findings); break;
+    case 'MERGE':    parseMerge(clean, info, findings); break;
+    default:
+      info.tables = '(no aplica para este tipo de sentencia)';
+      findings.push({
+        severity: SEVERITY.INFO,
+        title: `Sentencia de tipo ${lead}`,
+        detail: 'Este tipo de sentencia (DDL / permisos) generalmente requiere revisión manual del DBA antes de ejecutarse en productivo.'
+      });
+  }
+
+  // Comparación directa contra NULL (= NULL, <> NULL, != NULL):
+  // nunca es verdadera en SQL estándar.
+  if(/[=<>!]\s*NULL\b/i.test(clean)){
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: 'Comparación directa contra NULL',
+      detail: 'Una condición como "campo = NULL" nunca es verdadera en SQL estándar. Usa IS NULL o IS NOT NULL.'
+    });
+  }
+
+  return info;
+}
+
+/** Chequeos de sintaxis ajena al dialecto elegido. */
+function runDialectChecks(clean, dialect, findings){
+  const checks = DIALECT_CHECKS[dialect] || [];
+  for(const check of checks){
+    if(check.re.test(clean)){
+      findings.push({
+        severity: SEVERITY.WARNING,
+        title: `Sintaxis de otro motor detectada (dialecto: ${DIALECT_LABEL[dialect]})`,
+        detail: check.hint
+      });
+    }
+  }
+}
+
+/* ---------- Orquestador ---------- */
+
+/**
+ * Punto de entrada del análisis.
+ * @param {string} raw      Texto tal como lo escribió el usuario.
+ * @param {string} dialect  'generic' | 'oracle' | 'tsql'
+ * @returns {{findings:Array, statements:Array, stamp:string}}
+ */
+function analyze(raw, dialect){
+  const findings = [];
+  const clean = cleanSql(raw, findings);
+  checkParenBalance(clean, findings);
+
+  const segments = splitStatements(clean, raw);
+
+  if(segments.length > 1){
+    findings.push({
+      severity: SEVERITY.WARNING,
+      title: `Se detectaron ${segments.length} sentencias en el mismo bloque`,
+      detail: 'Ejecutar y validar cada sentencia por separado en productivo reduce el riesgo de que un error en una arrastre a las demás.'
+    });
+  }
+
+  const lastSegment = segments[segments.length - 1];
+  if(lastSegment && lastSegment.missingSemicolon){
+    findings.push({
+      severity: SEVERITY.INFO,
+      title: 'Falta el punto y coma final ( ; )',
+      detail: 'Algunos ejecutores de scripts en productivo requieren que cada sentencia termine en punto y coma.'
+    });
+  }
+
+  const statements = segments
+    .map(segment => parseStatement(segment, findings))
+    .filter(Boolean);
+
+  if(statements.length === 0 && !findings.some(f => f.severity === SEVERITY.CRITICAL)){
+    findings.push({
+      severity: SEVERITY.INFO,
+      title: 'No se reconoció ninguna sentencia',
+      detail: 'Verifica que el texto contenga una instrucción SQL válida (SELECT, INSERT, UPDATE, DELETE, etc.).'
+    });
+  }
+
+  runDialectChecks(clean, dialect, findings);
+
+  const hasCritical = findings.some(f => f.severity === SEVERITY.CRITICAL);
+  const hasWarning  = findings.some(f => f.severity === SEVERITY.WARNING);
+  const stamp = hasCritical ? 'crit' : (hasWarning ? 'warn' : 'ok');
+
+  return { findings, statements, stamp };
+}
+
+/* ---------- Interfaz ---------- */
+
+const ui = {
+  input:      document.getElementById('sqlInput'),
+  results:    document.getElementById('results'),
+  charCount:  document.getElementById('charCount'),
+  dialectBar: document.getElementById('dialectSelect'),
+  validate:   document.getElementById('validateBtn'),
+  clear:      document.getElementById('clearBtn')
+};
+
+let currentDialect = 'generic';
+
+function renderEmpty(){
+  ui.results.innerHTML = `<div class="empty-state">
+    <div class="glyph" aria-hidden="true">&#8942;</div>
+    <div>Ingresa una sentencia y presiona <strong>Validar sentencia</strong><br>para ver de dónde toma los datos, qué campos selecciona<br>y si le falta algún condicionante antes de correrla en productivo.</div>
+  </div>`;
+}
+
+function renderStatement(statement, index, total){
+  let html = '<div class="stmt-block">';
+  if(total > 1){
+    html += `<div class="stmt-head">Sentencia ${index + 1} — ${escapeHtml(statement.type)}</div>`;
+  }
+  if(statement.cte){
+    html += `<p class="cte-note">${escapeHtml(statement.cte)}</p>`;
+  }
+  // statement.fields ya viene como HTML seguro (escapado en fieldsAsTags);
+  // el resto de valores se escapa aquí.
+  html += `<div class="meta-grid">
+    <div class="meta-card"><div class="k">Tipo de sentencia</div><div class="v">${escapeHtml(statement.type)}</div></div>
+    <div class="meta-card"><div class="k">Origen de los datos (FROM / tabla)</div><div class="v">${escapeHtml(statement.tables)}</div></div>
+    <div class="meta-card full"><div class="k">Campos involucrados</div><div class="v">${statement.fields || '(vacío)'}</div></div>
+    <div class="meta-card full"><div class="k">Condición (WHERE)</div><div class="v">${escapeHtml(statement.where)}</div></div>
+  </div></div>`;
+  return html;
+}
+
+function renderFinding(finding){
+  return `<div class="finding ${finding.severity}">
+    <div class="sev" aria-hidden="true"></div>
+    <div class="finding-body">
+      <div class="finding-title">${escapeHtml(finding.title)}</div>
+      <div class="finding-detail">${escapeHtml(finding.detail)}</div>
+    </div>
+  </div>`;
+}
+
+function renderReport(report){
+  const stamp = STAMP[report.stamp];
+  let html = `<div class="stamp-row"><div class="stamp ${stamp.css}">${stamp.label}</div></div>`;
+
+  html += report.statements
+    .map((statement, idx) => renderStatement(statement, idx, report.statements.length))
+    .join('');
+
+  if(report.findings.length){
+    const sorted = [...report.findings].sort((a,b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
+    html += `<h2 class="findings-title">Hallazgos (${sorted.length})</h2>`;
+    html += sorted.map(renderFinding).join('');
+  } else {
+    html += `<h2 class="findings-title">Hallazgos</h2>`;
+    html += renderFinding({
+      severity: SEVERITY.INFO,
+      title: 'No se detectaron observaciones estructurales',
+      detail: 'Revisa igualmente la lógica de negocio de la sentencia; este análisis solo cubre riesgos estructurales comunes.'
+    });
+  }
+
+  ui.results.innerHTML = html;
+}
+
+function handleValidate(){
+  const sql = ui.input.value;
+  if(!sql.trim()){
+    renderEmpty();
+    ui.input.focus();
+    return;
+  }
+  renderReport(analyze(sql, currentDialect));
+}
+
+function handleClear(){
+  ui.input.value = '';
+  ui.charCount.textContent = '0 caracteres';
+  renderEmpty();
+  ui.input.focus();
+}
+
+function handleDialectClick(event){
+  const button = event.target.closest('button[data-dialect]');
+  if(!button) return;
+  currentDialect = button.dataset.dialect;
+  for(const b of ui.dialectBar.querySelectorAll('button[data-dialect]')){
+    b.setAttribute('aria-pressed', String(b === button));
+  }
+  // Si ya hay un resultado en pantalla, se reanaliza con el nuevo dialecto.
+  if(ui.input.value.trim() && !ui.results.querySelector('.empty-state')){
+    handleValidate();
+  }
+}
+
+ui.validate.addEventListener('click', handleValidate);
+ui.clear.addEventListener('click', handleClear);
+ui.dialectBar.addEventListener('click', handleDialectClick);
+ui.input.addEventListener('input', () => {
+  ui.charCount.textContent = `${ui.input.value.length} caracteres`;
+});
+ui.input.addEventListener('keydown', (event) => {
+  if((event.ctrlKey || event.metaKey) && event.key === 'Enter'){
+    event.preventDefault();
+    handleValidate();
+  }
+});
+
+renderEmpty();
+
+// Expuesto solo para pruebas automatizadas (no forma parte de la UI).
+if(typeof window !== 'undefined'){
+  window.__sqlValidator = { analyze };
+}
+
+})();
+</script>
+</body>
+</html>
