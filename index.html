@@ -177,7 +177,7 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 
 .findings-title{
   font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);
-  text-transform:uppercase;letter-spacing:.06em;margin:20px 0 10px;
+  text-transform:uppercase;letter-spacing:.06em;margin:20px 0 10px;font-weight:500;
 }
 .finding{
   display:flex;gap:12px;padding:12px 14px;border-radius:10px;
@@ -204,7 +204,25 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
   font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--accent);
   margin-bottom:8px;
 }
-.cte-note{font-size:12.5px;color:var(--muted);line-height:1.5;margin-bottom:10px;}
+.cte-note{font-size:12.5px;color:var(--muted);line-height:1.5;margin:0 0 10px;}
+
+.suggestion-wrap{margin-bottom:12px;}
+.pre-wrap{position:relative;}
+.suggestion{
+  margin:0;
+  background:#0F1520;border:1px solid var(--border);border-radius:10px;
+  padding:12px 84px 12px 14px;
+  font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.7;
+  white-space:pre-wrap;word-break:break-word;color:#C8D3E8;
+}
+.suggestion mark.fix{
+  background:var(--accent-dim);color:var(--accent);
+  border-radius:4px;padding:0 3px;font-style:normal;
+}
+.copy-btn{
+  position:absolute;top:8px;right:8px;
+  padding:4px 10px !important;font-size:11.5px !important;
+}
 
 footer{
   margin-top:26px;color:var(--muted);font-size:11.5px;text-align:center;line-height:1.6;
@@ -268,17 +286,18 @@ footer{
  * a ninguna base de datos.
  *
  * Diseño general:
- *  - cleanSql()   "apaga" strings y comentarios conservando el
- *                 largo del texto, para poder mapear posiciones
- *                 del texto limpio al texto original.
+ *  - cleanSql()        "apaga" strings y comentarios conservando
+ *                      el largo del texto, para mapear posiciones
+ *                      del texto limpio al texto original.
  *  - splitStatements() separa sentencias por ';' a nivel superior.
- *  - parseStatement() extrae metadatos (tipo, tablas, campos,
- *                 WHERE) y agrega hallazgos por sentencia.
- *  - Chequeos de dialecto: detectan funciones/sintaxis de otro
- *                 motor cuando el usuario elige Oracle o T-SQL.
+ *  - parseStatement()  extrae metadatos (tipo, tablas, campos,
+ *                      WHERE), agrega hallazgos y genera "fixes":
+ *                      rangos de texto con su corrección sugerida.
+ *  - applyFixes()      aplica los fixes sobre la sentencia original
+ *                      para producir la sugerencia de corrección
+ *                      con los cambios resaltados.
  * ============================================================ */
 
-/** Niveles de severidad de hallazgos (orden de prioridad al mostrar). */
 const SEVERITY = Object.freeze({ CRITICAL:'critical', WARNING:'warning', INFO:'info' });
 const SEVERITY_ORDER = Object.freeze({ critical:0, warning:1, info:2 });
 
@@ -288,8 +307,7 @@ const STAMP = Object.freeze({
   crit: { css:'crit', label:'Requiere revisión' }
 });
 
-/** Sintaxis ajena a cada dialecto: si el usuario elige Oracle y usa
- *  funciones de SQL Server (o viceversa), se le advierte. */
+/** Sintaxis ajena a cada dialecto. */
 const DIALECT_CHECKS = Object.freeze({
   oracle: [
     { re:/\bGETDATE\s*\(/i,       hint:'GETDATE() es de SQL Server; en Oracle usa SYSDATE o SYSTIMESTAMP.' },
@@ -313,7 +331,6 @@ const DIALECT_LABEL = Object.freeze({ oracle:'Oracle', tsql:'SQL Server', generi
 
 /* ---------- Utilidades de texto ---------- */
 
-/** Escapa texto para insertarlo de forma segura en HTML. */
 function escapeHtml(value){
   return String(value)
     .replace(/&/g,'&amp;')
@@ -322,16 +339,13 @@ function escapeHtml(value){
     .replace(/"/g,'&quot;');
 }
 
-/** Colapsa espacios múltiples en uno solo. */
 function collapseSpaces(value){
   return value.replace(/\s+/g,' ').trim();
 }
 
 /**
- * Reemplaza el contenido de strings ('...') y comentarios (-- y &sol;* *&sol;)
- * por espacios, conservando el largo y los saltos de línea. Así los
- * índices del texto limpio coinciden con los del original.
- * Agrega hallazgos si detecta strings o comentarios sin cerrar.
+ * Reemplaza el contenido de strings ('...') y comentarios (-- y bloque)
+ * por espacios, conservando el largo y los saltos de línea.
  */
 function cleanSql(raw, findings){
   const STATE = { NORMAL:0, STRING:1, LINE_COMMENT:2, BLOCK_COMMENT:3 };
@@ -345,7 +359,7 @@ function cleanSql(raw, findings){
 
     switch(state){
       case STATE.NORMAL:
-        if(ch === "'"){ state = STATE.STRING; out += ' '; i++; }
+        if(ch === "'"){ state = STATE.STRING; out += "'"; i++; }
         else if(ch === '-' && next === '-'){ state = STATE.LINE_COMMENT; out += '  '; i += 2; }
         else if(ch === '/' && next === '*'){ state = STATE.BLOCK_COMMENT; out += '  '; i += 2; }
         else { out += ch; i++; }
@@ -353,7 +367,7 @@ function cleanSql(raw, findings){
 
       case STATE.STRING:
         if(ch === "'" && next === "'"){ out += '  '; i += 2; }        // '' escapada
-        else if(ch === "'"){ state = STATE.NORMAL; out += ' '; i++; }
+        else if(ch === "'"){ state = STATE.NORMAL; out += "'"; i++; }
         else { out += (ch === '\n' ? '\n' : ' '); i++; }
         break;
 
@@ -387,7 +401,6 @@ function cleanSql(raw, findings){
   return out;
 }
 
-/** Valida el balance de paréntesis sobre el texto limpio. */
 function checkParenBalance(clean, findings){
   let depth = 0;
   let extraClosers = 0;
@@ -414,7 +427,6 @@ function checkParenBalance(clean, findings){
   }
 }
 
-/** Precalcula la profundidad de paréntesis en cada posición del texto. */
 function buildDepthMap(clean){
   const depthAt = new Array(clean.length);
   let depth = 0;
@@ -426,11 +438,6 @@ function buildDepthMap(clean){
   return depthAt;
 }
 
-/**
- * Devuelve las coincidencias de un patrón que ocurren a profundidad 0
- * de paréntesis (fuera de subconsultas). El patrón se clona para no
- * depender del estado lastIndex del llamador.
- */
 function topLevelMatches(clean, pattern){
   const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
   const depthAt = buildDepthMap(clean);
@@ -438,12 +445,11 @@ function topLevelMatches(clean, pattern){
   let m;
   while((m = re.exec(clean)) !== null){
     if(depthAt[m.index] === 0) matches.push({ index:m.index, text:m[0] });
-    if(m.index === re.lastIndex) re.lastIndex++;  // evita bucles infinitos con patrones vacíos
+    if(m.index === re.lastIndex) re.lastIndex++;
   }
   return matches;
 }
 
-/** Índice del ')' que cierra el '(' en openIdx, o -1 si no existe. */
 function matchingParen(text, openIdx){
   let depth = 0;
   for(let i = openIdx; i < text.length; i++){
@@ -456,7 +462,6 @@ function matchingParen(text, openIdx){
   return -1;
 }
 
-/** Separa el bloque en sentencias por ';' a profundidad 0. */
 function splitStatements(clean, raw){
   const segments = [];
   let depth = 0;
@@ -476,7 +481,6 @@ function splitStatements(clean, raw){
   return segments;
 }
 
-/** Divide por comas a profundidad 0 y devuelve las partes escapadas. */
 function splitTopLevelCommas(cleanSlice, origSlice){
   const parts = [];
   let depth = 0;
@@ -494,11 +498,6 @@ function splitTopLevelCommas(cleanSlice, origSlice){
   return parts.filter(p => p.length).map(p => escapeHtml(collapseSpaces(p)));
 }
 
-/**
- * Convierte una lista separada por comas en HTML de etiquetas.
- * cleanSlice y origSlice deben corresponder al mismo rango de texto.
- * Devuelve HTML seguro (las partes se escapan internamente).
- */
 function fieldsAsTags(cleanSlice, origSlice){
   const trimmed = origSlice.trim();
   if(!trimmed) return '';
@@ -507,9 +506,32 @@ function fieldsAsTags(cleanSlice, origSlice){
   return `<span class="tag">${parts.join('</span><span class="tag">')}</span>`;
 }
 
-/* ---------- Análisis por tipo de sentencia ---------- */
+/**
+ * Aplica una lista de correcciones {start, end, replacement} sobre un
+ * texto y devuelve la versión corregida en texto plano y en HTML con
+ * los cambios resaltados. Los rangos no deben traslaparse.
+ */
+function applyFixes(sourceText, fixes){
+  const sorted = [...fixes].sort((a,b) => a.start - b.start);
+  let plain = '';
+  let html = '';
+  let pos = 0;
+  for(const fix of sorted){
+    const start = Math.max(pos, Math.min(fix.start, sourceText.length));
+    const end = Math.max(start, Math.min(fix.end, sourceText.length));
+    const before = sourceText.slice(pos, start);
+    plain += before + fix.replacement;
+    html += escapeHtml(before) + `<mark class="fix">${escapeHtml(fix.replacement)}</mark>`;
+    pos = end;
+  }
+  const tail = sourceText.slice(pos);
+  plain += tail;
+  html += escapeHtml(tail);
+  return { text: plain, html };
+}
 
-/** Crea el hallazgo crítico estándar para UPDATE/DELETE sin WHERE. */
+/* ---------- Chequeos compartidos ---------- */
+
 function makeNoWhereFinding(keyword){
   return {
     severity: SEVERITY.CRITICAL,
@@ -518,7 +540,111 @@ function makeNoWhereFinding(keyword){
   };
 }
 
-function parseSelect(clean, original, info, findings){
+/** Marca al final de la sentencia el punto donde falta el WHERE. */
+function pushMissingWherePlaceholder(original, fixes){
+  const insertAt = original.replace(/\s+$/,'').length;
+  fixes.push({ start: insertAt, end: insertAt, replacement: ' /* FALTA: condición WHERE que delimite los registros */' });
+}
+
+/**
+ * Detecta comas a nivel superior dentro del WHERE. Una lista de valores
+ * después de '=' (campo = v1, v2, v3) es error de sintaxis: se sugiere
+ * IN (...). Cualquier otra coma suelta también se reporta.
+ */
+function checkWhereValueLists(clean, original, whereStart, whereEnd, findings, fixes){
+  const depthAt = buildDepthMap(clean);
+
+  // Separadores AND / OR a nivel superior dentro del rango del WHERE.
+  const seps = [];
+  const sepRe = /\b(AND|OR)\b/gi;
+  let m;
+  while((m = sepRe.exec(clean)) !== null){
+    if(m.index >= whereStart && m.index < whereEnd && depthAt[m.index] === 0) seps.push(m.index);
+  }
+
+  const bounds = [whereStart, ...seps, whereEnd];
+  let genericReported = false;
+
+  for(let s = 0; s < bounds.length - 1; s++){
+    const segStart = bounds[s];
+    const segEnd = bounds[s+1];
+
+    // Primera coma a nivel superior dentro del tramo.
+    let commaIdx = -1;
+    for(let i = segStart; i < segEnd; i++){
+      if(clean[i] === ',' && depthAt[i] === 0){ commaIdx = i; break; }
+    }
+    if(commaIdx === -1) continue;
+
+    // Buscar el '=' (comparación simple) antes de la coma.
+    let eqIdx = -1;
+    for(let i = commaIdx - 1; i >= segStart; i--){
+      if(depthAt[i] !== 0) continue;
+      const ch = clean[i];
+      if(ch === '='){
+        const prev = clean[i-1];
+        if(prev === '<' || prev === '>' || prev === '!') break; // <=, >=, != no aplican
+        eqIdx = i;
+        break;
+      }
+      if(ch === '<' || ch === '>' || ch === '!') break;
+    }
+
+    // Fin del listado de valores: último carácter no-espacio del tramo.
+    let valuesEnd = segEnd;
+    while(valuesEnd > segStart && /\s/.test(clean[valuesEnd-1])) valuesEnd--;
+
+    if(eqIdx !== -1){
+      const values = collapseSpaces(original.slice(eqIdx + 1, valuesEnd));
+      const fieldMatch = clean.slice(segStart, eqIdx).match(/([\w."$#\]\[]+)\s*$/);
+      const fieldName = fieldMatch ? fieldMatch[1] : 'campo';
+      const needSpace = eqIdx > 0 && !/\s/.test(clean[eqIdx-1]);
+
+      fixes.push({
+        start: eqIdx,
+        end: valuesEnd,
+        replacement: `${needSpace ? ' ' : ''}IN (${values})`
+      });
+      findings.push({
+        severity: SEVERITY.CRITICAL,
+        title: "Lista de valores con '=' en lugar de IN (...)",
+        detail: `Después de '=' solo puede ir un valor; tal como está, el motor marcará error de sintaxis. Para comparar contra varios valores usa: ${fieldName} IN (${values}).`
+      });
+    } else if(!genericReported){
+      genericReported = true;
+      findings.push({
+        severity: SEVERITY.CRITICAL,
+        title: 'Coma inesperada en la condición WHERE',
+        detail: 'Las condiciones del WHERE se combinan con AND / OR, o con listas de valores dentro de IN (...). Una coma suelta a este nivel provocará un error de sintaxis.'
+      });
+    }
+  }
+}
+
+/** Comparaciones directas contra NULL: = NULL, <> NULL, != NULL. */
+function checkNullComparisons(clean, findings, fixes){
+  const re = /([=<>!]{1,2})\s*NULL\b/gi;
+  let m;
+  let reported = false;
+  while((m = re.exec(clean)) !== null){
+    const op = m[1];
+    if(op === '<' || op === '>' || op === '<=' || op === '>=') continue; // comparaciones de orden: raras, no auto-corregibles
+    const replacement = (op === '=' ) ? 'IS NULL' : 'IS NOT NULL';
+    fixes.push({ start: m.index, end: m.index + m[0].length, replacement });
+    if(!reported){
+      reported = true;
+      findings.push({
+        severity: SEVERITY.WARNING,
+        title: 'Comparación directa contra NULL',
+        detail: 'Una condición como "campo = NULL" nunca es verdadera en SQL estándar. Usa IS NULL o IS NOT NULL.'
+      });
+    }
+  }
+}
+
+/* ---------- Análisis por tipo de sentencia ---------- */
+
+function parseSelect(clean, original, info, findings, fixes){
   const fromMatches = topLevelMatches(clean, /\bFROM\b/i);
   if(!fromMatches.length){
     findings.push({
@@ -532,18 +658,15 @@ function parseSelect(clean, original, info, findings){
   const fromIdx = fromMatches[0].index;
   const selectIdx = clean.search(/\bSELECT\b/i);
 
-  // Campos seleccionados: entre SELECT y FROM
   const fieldsStart = selectIdx + 'SELECT'.length;
   info.fields = fieldsAsTags(clean.slice(fieldsStart, fromIdx), original.slice(fieldsStart, fromIdx)) || '(vacío)';
 
-  // Origen: entre FROM y la siguiente cláusula a nivel superior
   const afterFrom = clean.slice(fromIdx + 'FROM'.length);
   const enders = topLevelMatches(afterFrom, /\b(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|UNION|CONNECT\s+BY|FETCH\s+FIRST)\b/i);
   const fromEnd = enders.length ? fromIdx + 'FROM'.length + enders[0].index : clean.length;
   const fromTextClean = clean.slice(fromIdx + 'FROM'.length, fromEnd);
   info.tables = collapseSpaces(original.slice(fromIdx + 'FROM'.length, fromEnd)) || '(no identificada)';
 
-  // JOIN sin ON/USING dentro del FROM (posible producto cartesiano)
   const joinMatches = topLevelMatches(fromTextClean, /\bJOIN\b/i);
   joinMatches.forEach((jm, idx) => {
     const segEnd = idx + 1 < joinMatches.length ? joinMatches[idx+1].index : fromTextClean.length;
@@ -558,13 +681,13 @@ function parseSelect(clean, original, info, findings){
     }
   });
 
-  // WHERE
   const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
   if(whereMatches.length){
     const whereStart = whereMatches[0].index + 'WHERE'.length;
     const afterWhere = topLevelMatches(clean.slice(whereStart), /\b(GROUP\s+BY|ORDER\s+BY|HAVING|UNION|FETCH\s+FIRST)\b/i);
     const whereEnd = afterWhere.length ? whereStart + afterWhere[0].index : clean.length;
     info.where = collapseSpaces(original.slice(whereStart, whereEnd)) || '(vacío)';
+    checkWhereValueLists(clean, original, whereStart, whereEnd, findings, fixes);
   } else {
     info.where = '(sin condición)';
     findings.push({
@@ -574,7 +697,6 @@ function parseSelect(clean, original, info, findings){
     });
   }
 
-  // SELECT * o SELECT alias.*
   if(/\bSELECT\s+(?:\w+\s*\.\s*)?\*/i.test(clean.slice(0, fromIdx))){
     findings.push({
       severity: SEVERITY.WARNING,
@@ -584,7 +706,7 @@ function parseSelect(clean, original, info, findings){
   }
 }
 
-function parseUpdate(clean, original, info, findings){
+function parseUpdate(clean, original, info, findings, fixes){
   const updateMatch = clean.match(/\bUPDATE\b/i);
   const setMatches = topLevelMatches(clean, /\bSET\b/i);
   const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
@@ -606,14 +728,17 @@ function parseUpdate(clean, original, info, findings){
   }
 
   if(whereMatches.length){
-    info.where = collapseSpaces(original.slice(whereMatches[0].index + 'WHERE'.length)) || '(vacío)';
+    const whereStart = whereMatches[0].index + 'WHERE'.length;
+    info.where = collapseSpaces(original.slice(whereStart)) || '(vacío)';
+    checkWhereValueLists(clean, original, whereStart, clean.length, findings, fixes);
   } else {
     info.where = '(sin condición)';
     findings.push(makeNoWhereFinding('UPDATE'));
+    pushMissingWherePlaceholder(original, fixes);
   }
 }
 
-function parseDelete(clean, original, info, findings){
+function parseDelete(clean, original, info, findings, fixes){
   const deleteMatch = clean.match(/\bDELETE\b/i);
   const fromMatches = topLevelMatches(clean, /\bFROM\b/i);
   const whereMatches = topLevelMatches(clean, /\bWHERE\b/i);
@@ -625,42 +750,67 @@ function parseDelete(clean, original, info, findings){
   info.tables = collapseSpaces(original.slice(tableStart, tableEnd)) || '(no identificada)';
 
   if(whereMatches.length){
-    info.where = collapseSpaces(original.slice(whereMatches[0].index + 'WHERE'.length)) || '(vacío)';
+    const whereStart = whereMatches[0].index + 'WHERE'.length;
+    info.where = collapseSpaces(original.slice(whereStart)) || '(vacío)';
+    checkWhereValueLists(clean, original, whereStart, clean.length, findings, fixes);
   } else {
     info.where = '(sin condición)';
     findings.push(makeNoWhereFinding('DELETE'));
+    pushMissingWherePlaceholder(original, fixes);
   }
 }
 
-function parseInsert(clean, original, info, findings){
+function parseInsert(clean, original, info, findings, fixes){
   const intoMatch = clean.match(/\bINTO\b/i);
   const sourceMatches = topLevelMatches(clean, /\b(VALUES|SELECT)\b/i);
+  const sourceIdx = sourceMatches.length ? sourceMatches[0].index : clean.length;
 
-  let columnsParen = intoMatch ? clean.indexOf('(', intoMatch.index) : -1;
-  // Si el primer '(' aparece después de VALUES/SELECT, pertenece a los
-  // valores y no a la lista de columnas.
-  if(columnsParen !== -1 && sourceMatches.length && columnsParen > sourceMatches[0].index){
-    columnsParen = -1;
-  }
+  info.where = '(no aplica en INSERT)';
 
-  if(intoMatch){
-    const tableEnd = columnsParen !== -1
-      ? columnsParen
-      : (sourceMatches.length ? sourceMatches[0].index : clean.length);
-    info.tables = collapseSpaces(original.slice(intoMatch.index + 'INTO'.length, tableEnd)) || '(no identificada)';
-  } else {
+  if(!intoMatch){
     findings.push({
       severity: SEVERITY.WARNING,
       title: 'INSERT sin cláusula INTO',
       detail: 'No se identificó la tabla destino. Verifica que la sentencia esté completa.'
     });
+    return;
   }
 
-  if(columnsParen !== -1){
-    const closeParen = matchingParen(clean, columnsParen);
+  // La tabla es el primer identificador después de INTO (admite esquema.tabla).
+  const afterInto = intoMatch.index + 'INTO'.length;
+  const tableMatch = clean.slice(afterInto, sourceIdx).match(/[A-Za-z_"\[][\w."$#\]\[]*/);
+  if(!tableMatch){
+    info.tables = '(no identificada)';
+    return;
+  }
+  const tableStart = afterInto + tableMatch.index;
+  const tableEnd = tableStart + tableMatch[0].length;
+  info.tables = original.slice(tableStart, tableEnd);
+
+  // Lo que queda entre la tabla y VALUES/SELECT debe ser la lista de
+  // columnas entre paréntesis, o nada.
+  const restClean = clean.slice(tableEnd, sourceIdx);
+  const restTrimmed = restClean.trim();
+
+  if(restTrimmed.startsWith('(')){
+    const openParen = clean.indexOf('(', tableEnd);
+    const closeParen = matchingParen(clean, openParen);
     if(closeParen !== -1){
-      info.fields = fieldsAsTags(clean.slice(columnsParen+1, closeParen), original.slice(columnsParen+1, closeParen)) || '(vacío)';
+      info.fields = fieldsAsTags(clean.slice(openParen+1, closeParen), original.slice(openParen+1, closeParen)) || '(vacío)';
     }
+  } else if(restTrimmed.length){
+    // Columnas presentes pero sin paréntesis: error de sintaxis.
+    const colStart = tableEnd + (restClean.length - restClean.trimStart().length);
+    const colEnd = tableEnd + restClean.replace(/\s+$/,'').length;
+    const columnsText = collapseSpaces(original.slice(colStart, colEnd));
+
+    info.fields = fieldsAsTags(clean.slice(colStart, colEnd), original.slice(colStart, colEnd)) || '(vacío)';
+    findings.push({
+      severity: SEVERITY.CRITICAL,
+      title: 'Lista de columnas sin paréntesis',
+      detail: `En un INSERT, las columnas deben ir entre paréntesis después del nombre de la tabla: ${collapseSpaces(info.tables)} (${columnsText}) VALUES (...). Tal como está, el motor marcará error de sintaxis.`
+    });
+    fixes.push({ start: colStart, end: colEnd, replacement: `(${columnsText})` });
   } else {
     info.fields = '(no se listaron columnas explícitamente)';
     findings.push({
@@ -669,8 +819,6 @@ function parseInsert(clean, original, info, findings){
       detail: 'Si la estructura de la tabla cambia (se agrega/elimina una columna), este script fallará o insertará datos en la columna equivocada. Se recomienda declarar las columnas explícitamente.'
     });
   }
-
-  info.where = '(no aplica en INSERT)';
 }
 
 function parseDestructive(lead, original, info, findings){
@@ -700,9 +848,9 @@ function parseMerge(clean, info, findings){
 }
 
 /**
- * Analiza una sentencia individual: identifica su tipo, extrae
- * metadatos y agrega hallazgos a la lista compartida.
- * Devuelve el objeto de metadatos, o null si no se reconoció nada.
+ * Analiza una sentencia individual. Devuelve metadatos + fixes con
+ * índices relativos a sourceText (la sentencia original recortada),
+ * o null si no se reconoció nada.
  */
 function parseStatement(segment, findings){
   const trimmedClean = segment.clean.trim();
@@ -722,28 +870,28 @@ function parseStatement(segment, findings){
   let lead = leadMatch[1].toUpperCase();
   let clean = segment.clean;
   let original = segment.original;
+  let shift = 0;         // desplazamiento aplicado por CTE
   let cteNote = null;
 
-  // Si empieza con WITH, el análisis se aplica a la instrucción
-  // principal después de las CTE. Desplazamos clean y original juntos
-  // para que los índices sigan alineados.
   if(lead === 'WITH'){
     const mainKeyword = topLevelMatches(clean, /\b(SELECT|INSERT|UPDATE|DELETE|MERGE)\b/i);
     if(mainKeyword.length){
       lead = mainKeyword[0].text.toUpperCase();
-      clean = clean.slice(mainKeyword[0].index);
-      original = original.slice(mainKeyword[0].index);
+      shift = mainKeyword[0].index;
+      clean = clean.slice(shift);
+      original = original.slice(shift);
       cteNote = 'La sentencia usa una o más CTE (WITH ...). El análisis se aplica a la instrucción principal después de las CTE.';
     }
   }
 
   const info = { type:lead, tables:'—', fields:'—', where:'—', cte:cteNote };
+  const fixes = [];  // índices relativos a `original` (desplazado por CTE)
 
   switch(lead){
-    case 'SELECT':   parseSelect(clean, original, info, findings); break;
-    case 'UPDATE':   parseUpdate(clean, original, info, findings); break;
-    case 'DELETE':   parseDelete(clean, original, info, findings); break;
-    case 'INSERT':   parseInsert(clean, original, info, findings); break;
+    case 'SELECT':   parseSelect(clean, original, info, findings, fixes); break;
+    case 'UPDATE':   parseUpdate(clean, original, info, findings, fixes); break;
+    case 'DELETE':   parseDelete(clean, original, info, findings, fixes); break;
+    case 'INSERT':   parseInsert(clean, original, info, findings, fixes); break;
     case 'DROP':
     case 'TRUNCATE': parseDestructive(lead, original, info, findings); break;
     case 'MERGE':    parseMerge(clean, info, findings); break;
@@ -756,20 +904,22 @@ function parseStatement(segment, findings){
       });
   }
 
-  // Comparación directa contra NULL (= NULL, <> NULL, != NULL):
-  // nunca es verdadera en SQL estándar.
-  if(/[=<>!]\s*NULL\b/i.test(clean)){
-    findings.push({
-      severity: SEVERITY.WARNING,
-      title: 'Comparación directa contra NULL',
-      detail: 'Una condición como "campo = NULL" nunca es verdadera en SQL estándar. Usa IS NULL o IS NOT NULL.'
-    });
-  }
+  checkNullComparisons(clean, findings, fixes);
+
+  // Mapear los índices de los fixes al texto de la sentencia recortada
+  // (sourceText): se suma el desplazamiento por CTE y se resta el
+  // espacio en blanco inicial del segmento.
+  const lead0 = segment.original.length - segment.original.trimStart().length;
+  info.sourceText = segment.original.trim();
+  info.fixes = fixes.map(f => ({
+    start: Math.max(0, f.start + shift - lead0),
+    end: Math.max(0, f.end + shift - lead0),
+    replacement: f.replacement
+  }));
 
   return info;
 }
 
-/** Chequeos de sintaxis ajena al dialecto elegido. */
 function runDialectChecks(clean, dialect, findings){
   const checks = DIALECT_CHECKS[dialect] || [];
   for(const check of checks){
@@ -789,7 +939,7 @@ function runDialectChecks(clean, dialect, findings){
  * Punto de entrada del análisis.
  * @param {string} raw      Texto tal como lo escribió el usuario.
  * @param {string} dialect  'generic' | 'oracle' | 'tsql'
- * @returns {{findings:Array, statements:Array, stamp:string}}
+ * @returns {{findings:Array, statements:Array, suggestions:Array, stamp:string}}
  */
 function analyze(raw, dialect){
   const findings = [];
@@ -806,6 +956,10 @@ function analyze(raw, dialect){
     });
   }
 
+  const statements = segments
+    .map(segment => parseStatement(segment, findings))
+    .filter(Boolean);
+
   const lastSegment = segments[segments.length - 1];
   if(lastSegment && lastSegment.missingSemicolon){
     findings.push({
@@ -813,11 +967,12 @@ function analyze(raw, dialect){
       title: 'Falta el punto y coma final ( ; )',
       detail: 'Algunos ejecutores de scripts en productivo requieren que cada sentencia termine en punto y coma.'
     });
+    const lastStatement = statements[statements.length - 1];
+    if(lastStatement){
+      const end = lastStatement.sourceText.length;
+      lastStatement.fixes.push({ start: end, end, replacement: ';' });
+    }
   }
-
-  const statements = segments
-    .map(segment => parseStatement(segment, findings))
-    .filter(Boolean);
 
   if(statements.length === 0 && !findings.some(f => f.severity === SEVERITY.CRITICAL)){
     findings.push({
@@ -829,11 +984,26 @@ function analyze(raw, dialect){
 
   runDialectChecks(clean, dialect, findings);
 
+  // Sugerencias de corrección: solo para sentencias con fixes.
+  const suggestions = [];
+  statements.forEach((statement, index) => {
+    if(statement.fixes.length){
+      const applied = applyFixes(statement.sourceText, statement.fixes);
+      suggestions.push({
+        index,
+        total: statements.length,
+        type: statement.type,
+        html: applied.html,
+        text: applied.text
+      });
+    }
+  });
+
   const hasCritical = findings.some(f => f.severity === SEVERITY.CRITICAL);
   const hasWarning  = findings.some(f => f.severity === SEVERITY.WARNING);
   const stamp = hasCritical ? 'crit' : (hasWarning ? 'warn' : 'ok');
 
-  return { findings, statements, stamp };
+  return { findings, statements, suggestions, stamp };
 }
 
 /* ---------- Interfaz ---------- */
@@ -848,6 +1018,7 @@ const ui = {
 };
 
 let currentDialect = 'generic';
+let lastSuggestions = [];
 
 function renderEmpty(){
   ui.results.innerHTML = `<div class="empty-state">
@@ -864,8 +1035,6 @@ function renderStatement(statement, index, total){
   if(statement.cte){
     html += `<p class="cte-note">${escapeHtml(statement.cte)}</p>`;
   }
-  // statement.fields ya viene como HTML seguro (escapado en fieldsAsTags);
-  // el resto de valores se escapa aquí.
   html += `<div class="meta-grid">
     <div class="meta-card"><div class="k">Tipo de sentencia</div><div class="v">${escapeHtml(statement.type)}</div></div>
     <div class="meta-card"><div class="k">Origen de los datos (FROM / tabla)</div><div class="v">${escapeHtml(statement.tables)}</div></div>
@@ -883,6 +1052,22 @@ function renderFinding(finding){
       <div class="finding-detail">${escapeHtml(finding.detail)}</div>
     </div>
   </div>`;
+}
+
+function renderSuggestions(suggestions){
+  if(!suggestions.length) return '';
+  let html = `<h2 class="findings-title">Sugerencia de corrección</h2>`;
+  html += `<p class="cte-note">Los fragmentos resaltados indican la corrección aplicada o lo que falta y en qué punto de la sentencia. Revisa la sugerencia antes de usarla.</p>`;
+  suggestions.forEach((s, i) => {
+    const head = s.total > 1 ? `<div class="stmt-head">Sentencia ${s.index + 1} — ${escapeHtml(s.type)}</div>` : '';
+    html += `<div class="suggestion-wrap">${head}
+      <div class="pre-wrap">
+        <pre class="suggestion">${s.html}</pre>
+        <button type="button" class="ghost copy-btn" data-copy-idx="${i}">Copiar</button>
+      </div>
+    </div>`;
+  });
+  return html;
 }
 
 function renderReport(report){
@@ -906,7 +1091,35 @@ function renderReport(report){
     });
   }
 
+  html += renderSuggestions(report.suggestions);
+
+  lastSuggestions = report.suggestions.map(s => s.text);
   ui.results.innerHTML = html;
+}
+
+function copyToClipboard(text, button){
+  const restore = () => { setTimeout(() => { button.textContent = 'Copiar'; }, 1500); };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(() => {
+      button.textContent = 'Copiado';
+      restore();
+    }).catch(() => {
+      button.textContent = 'Error';
+      restore();
+    });
+  } else {
+    // Respaldo para contextos sin Clipboard API (http, navegadores viejos).
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.style.position = 'fixed';
+    helper.style.opacity = '0';
+    document.body.appendChild(helper);
+    helper.select();
+    try { document.execCommand('copy'); button.textContent = 'Copiado'; }
+    catch(e){ button.textContent = 'Error'; }
+    document.body.removeChild(helper);
+    restore();
+  }
 }
 
 function handleValidate(){
@@ -933,7 +1146,6 @@ function handleDialectClick(event){
   for(const b of ui.dialectBar.querySelectorAll('button[data-dialect]')){
     b.setAttribute('aria-pressed', String(b === button));
   }
-  // Si ya hay un resultado en pantalla, se reanaliza con el nuevo dialecto.
   if(ui.input.value.trim() && !ui.results.querySelector('.empty-state')){
     handleValidate();
   }
@@ -942,6 +1154,12 @@ function handleDialectClick(event){
 ui.validate.addEventListener('click', handleValidate);
 ui.clear.addEventListener('click', handleClear);
 ui.dialectBar.addEventListener('click', handleDialectClick);
+ui.results.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-copy-idx]');
+  if(!button) return;
+  const text = lastSuggestions[Number(button.dataset.copyIdx)] || '';
+  copyToClipboard(text, button);
+});
 ui.input.addEventListener('input', () => {
   ui.charCount.textContent = `${ui.input.value.length} caracteres`;
 });
@@ -956,7 +1174,7 @@ renderEmpty();
 
 // Expuesto solo para pruebas automatizadas (no forma parte de la UI).
 if(typeof window !== 'undefined'){
-  window.__sqlValidator = { analyze };
+  window.__sqlValidator = { analyze, applyFixes };
 }
 
 })();
